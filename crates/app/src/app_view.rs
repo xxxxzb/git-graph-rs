@@ -998,6 +998,7 @@ impl GitGraphApp {
         &mut self,
         delta_x: f32,
         touch_phase: TouchPhase,
+        precise: bool,
         cx: &mut Context<Self>,
     ) {
         let reduced_motion = cx.theme().reduced_motion;
@@ -1009,9 +1010,13 @@ impl GitGraphApp {
             return;
         };
 
-        if touch_phase == TouchPhase::Cancelled {
+        if touch_phase == TouchPhase::Started || !precise {
+            tab.graph_overscroll.begin_touch();
+        }
+
+        if matches!(touch_phase, TouchPhase::Ended | TouchPhase::Cancelled) {
             tab._graph_overscroll_task = None;
-            tab.graph_overscroll.release(reduced_motion);
+            tab.graph_overscroll.end_touch(reduced_motion);
             cx.notify();
             return;
         }
@@ -1038,17 +1043,13 @@ impl GitGraphApp {
             }
         }
 
-        if touch_phase == TouchPhase::Ended {
-            tab._graph_overscroll_task = None;
-            tab.graph_overscroll.release(reduced_motion);
-            cx.notify();
-            return;
-        }
-
-        if tab.graph_overscroll.is_active() && !reduced_motion {
+        if tab.graph_overscroll.is_active()
+            && !tab.graph_overscroll.is_animating()
+            && !reduced_motion
+        {
             tab._graph_overscroll_task = Some(cx.spawn(async move |weak, cx| {
                 cx.background_executor()
-                    .timer(RubberBandSpring::IDLE_RELEASE_TIMEOUT + Duration::from_millis(8))
+                    .timer(RubberBandSpring::IDLE_RELEASE_TIMEOUT + Duration::from_millis(6))
                     .await;
                 weak.update(cx, |this, cx| {
                     let reduced = cx.theme().reduced_motion;
@@ -1082,6 +1083,7 @@ impl GitGraphApp {
         }
 
         let reduced_motion = cx.theme().reduced_motion;
+        let precise = event.delta.precise();
         let Some(tab_id) = self.active_tab_id else {
             return;
         };
@@ -1089,12 +1091,21 @@ impl GitGraphApp {
             return;
         };
 
+        if event.touch_phase == TouchPhase::Started || !precise {
+            tab.vertical_overscroll.begin_touch();
+        }
+
         if matches!(event.touch_phase, TouchPhase::Ended | TouchPhase::Cancelled) {
             tab._vertical_overscroll_task = None;
-            if tab.vertical_overscroll.is_active() {
-                tab.vertical_overscroll.release(reduced_motion);
+            let was_active = tab.vertical_overscroll.is_active();
+            tab.vertical_overscroll.end_touch(reduced_motion);
+            if was_active {
                 cx.notify();
             }
+            return;
+        }
+
+        if tab.vertical_overscroll.is_ignoring_momentum() {
             return;
         }
 
@@ -1141,10 +1152,10 @@ impl GitGraphApp {
         }
 
         let active = tab.vertical_overscroll.is_active();
-        if active && !reduced_motion {
+        if active && !tab.vertical_overscroll.is_animating() && !reduced_motion {
             tab._vertical_overscroll_task = Some(cx.spawn(async move |weak, cx| {
                 cx.background_executor()
-                    .timer(RubberBandSpring::IDLE_RELEASE_TIMEOUT + Duration::from_millis(8))
+                    .timer(RubberBandSpring::IDLE_RELEASE_TIMEOUT + Duration::from_millis(6))
                     .await;
                 weak.update(cx, |this, cx| {
                     let reduced = cx.theme().reduced_motion;

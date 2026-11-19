@@ -782,24 +782,37 @@ pub fn render_graph_table(
                             .w(px(graph_col_w))
                             .h(row_h)
                             .on_scroll(move |event: &ScrollEvent, _, cx| {
+                                let phase = event.touch_phase;
+                                let precise = event.delta.precise();
                                 let decision = weak_graph_scroll
                                     .update(cx, |this, _| this.classify_scroll_axis(event))
                                     .unwrap_or(ScrollAxisDecision::Neutral);
                                 if let ScrollAxisDecision::Horizontal(dx) = decision {
                                     cx.stop_propagation();
-                                    let phase = event.touch_phase;
                                     if dx.abs() > 0.01
                                         || matches!(
                                             phase,
-                                            TouchPhase::Ended | TouchPhase::Cancelled
+                                            TouchPhase::Started
+                                                | TouchPhase::Ended
+                                                | TouchPhase::Cancelled
                                         )
                                     {
                                         weak_graph_scroll
                                             .update(cx, |this, cx| {
-                                                this.handle_graph_horizontal_scroll(dx, phase, cx);
+                                                this.handle_graph_horizontal_scroll(
+                                                    dx, phase, precise, cx,
+                                                );
                                             })
                                             .ok();
                                     }
+                                } else if phase == TouchPhase::Started {
+                                    weak_graph_scroll
+                                        .update(cx, |this, cx| {
+                                            this.handle_graph_horizontal_scroll(
+                                                0.0, phase, precise, cx,
+                                            );
+                                        })
+                                        .ok();
                                 }
                             })
                             .child(graph_cell_canvas);
@@ -1144,21 +1157,31 @@ fn render_table_header(
         .justify_between()
         .px_2()
         .on_scroll(move |event: &ScrollEvent, _, cx| {
+            let phase = event.touch_phase;
+            let precise = event.delta.precise();
             let decision = weak_header_scroll
                 .update(cx, |this, _| this.classify_scroll_axis(event))
                 .unwrap_or(ScrollAxisDecision::Neutral);
             if let ScrollAxisDecision::Horizontal(dx) = decision {
                 cx.stop_propagation();
-                let phase = event.touch_phase;
                 if dx.abs() > 0.01
-                    || matches!(phase, TouchPhase::Ended | TouchPhase::Cancelled)
+                    || matches!(
+                        phase,
+                        TouchPhase::Started | TouchPhase::Ended | TouchPhase::Cancelled
+                    )
                 {
                     weak_header_scroll
                         .update(cx, |this, cx| {
-                            this.handle_graph_horizontal_scroll(dx, phase, cx);
+                            this.handle_graph_horizontal_scroll(dx, phase, precise, cx);
                         })
                         .ok();
                 }
+            } else if phase == TouchPhase::Started {
+                weak_header_scroll
+                    .update(cx, |this, cx| {
+                        this.handle_graph_horizontal_scroll(0.0, phase, precise, cx);
+                    })
+                    .ok();
             }
         })
         .child(col_label("图形"))

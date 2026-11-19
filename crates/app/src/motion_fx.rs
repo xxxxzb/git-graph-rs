@@ -31,6 +31,9 @@ pub struct RubberBandSpring {
     offset: f32,
     last_pull_at: Option<Instant>,
     release: Option<SpringRelease>,
+    /// 手指离开触控板（`TouchPhase::Ended`）后屏蔽后续 macOS 惯性滑行帧，
+    /// 避免系统惯性 `Moved` 帧反复打断已启动的弹性回弹，直到下一次 `TouchPhase::Started` 才解除。
+    ignore_momentum: bool,
 }
 
 impl Default for RubberBandSpring {
@@ -44,10 +47,10 @@ impl RubberBandSpring {
     pub const DEFAULT_MAX_PULL_PX: f32 = 28.0;
     /// 默认阻尼系数 `k`。
     pub const DEFAULT_STIFFNESS_K: f32 = 56.0;
-    /// 超过该间隔无新滚轮事件时自动触发回弹（ms）。
-    pub const IDLE_RELEASE_TIMEOUT: Duration = Duration::from_millis(120);
+    /// 超过该间隔无新滚轮事件时自动触发回弹（ms，针对不发 `Ended` 的鼠标滚轮，响应干脆）。
+    pub const IDLE_RELEASE_TIMEOUT: Duration = Duration::from_millis(48);
     /// 弹簧回弹总时长（ms）。
-    pub const SPRING_DURATION: Duration = Duration::from_millis(260);
+    pub const SPRING_DURATION: Duration = Duration::from_millis(220);
 
     /// 创建指定最大过冲上限（px）的橡皮筋弹簧模型。
     pub fn new(max_pull: f32) -> Self {
@@ -58,7 +61,30 @@ impl RubberBandSpring {
             offset: 0.0,
             last_pull_at: None,
             release: None,
+            ignore_momentum: false,
         }
+    }
+
+    /// 收到新一轮触控开始（`TouchPhase::Started`）或离散鼠标滚轮时调用，解除惯性屏蔽。
+    pub fn begin_touch(&mut self) {
+        self.ignore_momentum = false;
+    }
+
+    /// 收到手指抬起（`TouchPhase::Ended` / `Cancelled`）时调用：
+    /// 立刻触发弹簧回弹，并屏蔽紧随其后的 macOS 惯性 `Moved` 帧防止打断回弹。
+    pub fn end_touch(&mut self, reduced_motion: bool) {
+        self.end_touch_at(Instant::now(), reduced_motion);
+    }
+
+    /// 在指定时刻 `now` 结束触控并立即启动弹性回弹（同时屏蔽后续惯性帧）。
+    pub fn end_touch_at(&mut self, now: Instant, reduced_motion: bool) {
+        self.ignore_momentum = true;
+        self.release_at(now, reduced_motion);
+    }
+
+    /// 当前是否处于松手后的惯性屏蔽阶段。
+    pub fn is_ignoring_momentum(&self) -> bool {
+        self.ignore_momentum
     }
 
     /// 当前弹性偏移量（px，范围 `[-max_pull, +max_pull]`）。
@@ -108,6 +134,7 @@ impl RubberBandSpring {
         self.offset = 0.0;
         self.last_pull_at = None;
         self.release = None;
+        self.ignore_momentum = false;
     }
 
     /// 在指定时刻 `now` 累加过冲增量并更新阻尼偏移。
@@ -116,7 +143,7 @@ impl RubberBandSpring {
             self.reset();
             return 0.0;
         }
-        if !delta.is_finite() || delta == 0.0 {
+        if self.ignore_momentum || !delta.is_finite() || delta == 0.0 {
             return self.offset;
         }
         if self.release.is_some() {
@@ -132,7 +159,7 @@ impl RubberBandSpring {
 
     /// 当用户向回滑动（`delta` 与当前过冲方向相反）时，先抵消既有过冲并返回剩余未消费的 `delta`。
     pub fn consume_opposite(&mut self, delta: f32, now: Instant, reduced_motion: bool) -> f32 {
-        if !delta.is_finite() || delta == 0.0 {
+        if self.ignore_momentum || !delta.is_finite() || delta == 0.0 {
             return delta;
         }
         if reduced_motion {
@@ -331,16 +358,16 @@ mod tests {
         spring.pull_at(35.0, t0, false);
         assert!(!spring.is_animating());
 
-        // 未到 120ms 超时不会提前释放
-        assert!(!spring.tick_at(t0 + Duration::from_millis(60), false));
+        // 未到 48ms 超时不会提前释放
+        assert!(!spring.tick_at(t0 + Duration::from_millis(24), false));
         assert!(!spring.is_animating());
 
-        // 超过 120ms 无新事件后自动进入弹簧回弹
-        assert!(spring.tick_at(t0 + Duration::from_millis(125), false));
+        // 超过 48ms 无新事件后自动进入弹簧回弹
+        assert!(spring.tick_at(t0 + Duration::from_millis(52), false));
         assert!(spring.is_animating());
 
         // reduced_motion=true 时立即归零，绝不继续请求动画帧
-        assert!(!spring.tick_at(t0 + Duration::from_millis(140), true));
+        assert!(!spring.tick_at(t0 + Duration::from_millis(70), true));
         assert!(!spring.is_animating());
         assert_eq!(spring.offset(), 0.0);
 
@@ -372,6 +399,43 @@ mod tests {
         bottom.release_at(t0, false);
         assert!(!bottom.tick_at(t0 + Duration::from_millis(300), false));
         assert_eq!(bottom.offset(), 0.0);
+    }
+
+    #[test]
+    fn rubber_band_spring_ignores_macos_momentum_after_touch_end() {
+        let mut spring_fx = RubberBandSpring::new(20.0);
+        let t0 = Instant::now();
+
+        // 1. 手指按住拉出过冲
+        spring_fx.begin_touch();
+        let pulled = spring_fx.pull_at(45.0, t0, false);
+        assert!(pulled > 8.0);
+
+        // 2. 手指离开触控板 (TouchPhase::Ended) -> 立刻开始弹簧回弹并屏蔽后续惯性帧
+        spring_fx.end_touch_at(t0, false);
+        assert!(spring_fx.is_ignoring_momentum());
+        assert!(spring_fx.is_animating());
+
+        // 3. 16ms 后系统惯性滑行帧 (Moved) 到达 -> 绝不打断已启动的回弹，也绝不再拉大偏移
+        let before_momentum = spring_fx.offset();
+        let after_momentum = spring_fx.pull_at(60.0, t0 + Duration::from_millis(16), false);
+        assert_eq!(after_momentum, before_momentum);
+        assert!(spring_fx.is_animating());
+
+        // 4. 220ms 后准时回弹归零
+        assert!(!spring_fx.tick_at(t0 + Duration::from_millis(230), false));
+        assert_eq!(spring_fx.offset(), 0.0);
+
+        // 5. 惯性尾帧仍不会凭空拉出二次过冲
+        assert_eq!(
+            spring_fx.pull_at(30.0, t0 + Duration::from_millis(260), false),
+            0.0
+        );
+
+        // 6. 下一次手指重新触屏 (TouchPhase::Started) -> 立刻恢复可拉动
+        spring_fx.begin_touch();
+        assert!(!spring_fx.is_ignoring_momentum());
+        assert!(spring_fx.pull_at(30.0, t0 + Duration::from_millis(300), false) > 0.0);
     }
 
     #[test]

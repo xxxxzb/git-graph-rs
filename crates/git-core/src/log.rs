@@ -279,11 +279,11 @@ fn walk_author_date_window(
         for parent in shallow_parents(&commit, shallow_ref, first_parent_only) {
             let entry = waiting.entry(parent).or_insert(0);
             *entry = entry.saturating_sub(1);
-            if *entry == 0 {
-                if let Some(&date) = dates.get(&parent) {
-                    ready.push((date, Reverse(sequence), parent));
-                    sequence += 1;
-                }
+            if *entry == 0
+                && let Some(&date) = dates.get(&parent)
+            {
+                ready.push((date, Reverse(sequence), parent));
+                sequence += 1;
             }
         }
     }
@@ -693,10 +693,10 @@ pub fn resolve_tips(repo: &Repo, revisions: &[String]) -> Result<Vec<ObjectId>> 
         if !requested.insert(revision.as_str()) {
             continue;
         }
-        if let Ok(id) = crate::repository::resolve_commit_in(&git, revision) {
-            if seen.insert(id) {
-                tips.push(id);
-            }
+        if let Ok(id) = crate::repository::resolve_commit_in(&git, revision)
+            && seen.insert(id)
+        {
+            tips.push(id);
         }
     }
     Ok(tips)
@@ -782,10 +782,10 @@ pub fn search_history(repo: &Repo, query: &str) -> Result<Vec<GitHistoryMatch>> 
 
     // A repository with no refs at all has nothing to search; git's `--all` simply matches nothing.
     let mut tips = all_tips(repo, true, true).unwrap_or_default();
-    if let Some(stash) = stash_tip(repo) {
-        if !tips.contains(&stash) {
-            tips.push(stash);
-        }
+    if let Some(stash) = stash_tip(repo)
+        && !tips.contains(&stash)
+    {
+        tips.push(stash);
     }
     if tips.is_empty() {
         return Ok(Vec::new());

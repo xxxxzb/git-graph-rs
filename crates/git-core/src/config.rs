@@ -243,10 +243,10 @@ pub fn config_list(
 /// `~/.gitconfig`, else the XDG one — git's own order.
 fn global_config_path() -> Result<std::path::PathBuf> {
     use std::path::PathBuf;
-    if let Ok(explicit) = std::env::var("GIT_CONFIG_GLOBAL") {
-        if !explicit.is_empty() {
-            return Ok(PathBuf::from(explicit));
-        }
+    if let Ok(explicit) = std::env::var("GIT_CONFIG_GLOBAL")
+        && !explicit.is_empty()
+    {
+        return Ok(PathBuf::from(explicit));
     }
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))

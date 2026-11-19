@@ -2066,15 +2066,11 @@ dependencies = [
 [[package]]
 name = "git-graph-layout"
 version = "0.1.0"
-dependencies = [
- "git-graph-core",
-]
 
 [[package]]
 name = "git-graph-ops"
 version = "0.1.0"
 dependencies = [
- "git-graph-core",
  "log",
  "notify",
  "tempfile",

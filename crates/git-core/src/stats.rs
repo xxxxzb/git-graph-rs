@@ -19,10 +19,10 @@ use crate::types::{GitActivityCell, GitAuthorStat};
 /// already-tested walk's behaviour.
 fn all_tips_with_stash(repo: &Repo) -> Result<Vec<gix::ObjectId>> {
     let mut tips = all_tips(repo, true, true)?;
-    if let Some(stash) = stash_tip(repo) {
-        if !tips.contains(&stash) {
-            tips.push(stash);
-        }
+    if let Some(stash) = stash_tip(repo)
+        && !tips.contains(&stash)
+    {
+        tips.push(stash);
     }
     Ok(tips)
 }

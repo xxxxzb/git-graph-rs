@@ -297,10 +297,10 @@ pub fn parse_meta_commit(record: &MetaCommitRecord) -> Option<ParsedMetaCommit> 
     // the submitter.
     if let Some(merged_by) = merged_by {
         parsed.event.reviewer = Some(merged_by);
-    } else if parsed.event.kind == "merged" {
-        if let Some(m) = regex_submitted_by().captures(message) {
-            parsed.event.reviewer = Some(m[1].trim().to_string());
-        }
+    } else if parsed.event.kind == "merged"
+        && let Some(m) = regex_submitted_by().captures(message)
+    {
+        parsed.event.reviewer = Some(m[1].trim().to_string());
     }
 
     parsed.event.patchset = parsed.patchset;
@@ -341,29 +341,29 @@ pub fn parse_meta_history(change: u64, records: &[MetaCommitRecord]) -> Option<G
             latest_patchset = parsed.patchset;
         }
         // Records are iterated newest first: the first (i.e. most recent) status/wip transition wins
-        if let Some(parsed_status) = parsed.status {
-            if !status_determined {
-                status = parsed_status;
-                status_determined = true;
-            }
+        if let Some(parsed_status) = parsed.status
+            && !status_determined
+        {
+            status = parsed_status;
+            status_determined = true;
         }
-        if let Some(parsed_wip) = parsed.wip {
-            if !wip_determined {
-                wip = parsed_wip;
-                wip_determined = true;
-            }
+        if let Some(parsed_wip) = parsed.wip
+            && !wip_determined
+        {
+            wip = parsed_wip;
+            wip_determined = true;
         }
         if let Some(hash) = parsed.commit_hash {
             commit_by_patchset.entry(parsed.patchset).or_insert(hash);
         }
-        if parsed.event.kind == "vote" {
-            if let Some(labels) = &parsed.event.labels {
-                for label in labels {
-                    if label.name == "Code-Review" {
-                        cr_votes.push(label.value);
-                    } else if label.name == "Verified" {
-                        v_votes.push(label.value);
-                    }
+        if parsed.event.kind == "vote"
+            && let Some(labels) = &parsed.event.labels
+        {
+            for label in labels {
+                if label.name == "Code-Review" {
+                    cr_votes.push(label.value);
+                } else if label.name == "Verified" {
+                    v_votes.push(label.value);
                 }
             }
         }

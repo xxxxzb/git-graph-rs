@@ -621,20 +621,32 @@ fn lists_the_global_configuration_and_declines_includes() {
     let _guard = ENV_LOCK.lock().unwrap();
     let global = repo.path().join("global-gitconfig");
     std::fs::write(&global, "[user]\n\tname = Global Identity\n").unwrap();
-    std::env::set_var("GIT_CONFIG_GLOBAL", &global);
+    // SAFETY: Serialised via `ENV_LOCK`.
+    unsafe {
+        std::env::set_var("GIT_CONFIG_GLOBAL", &global);
+    }
 
     let engine = open(&repo);
     let config = config::config_list(&engine, config::ConfigLocation::Global).unwrap();
 
-    std::env::remove_var("GIT_CONFIG_GLOBAL");
+    // SAFETY: Serialised via `ENV_LOCK`.
+    unsafe {
+        std::env::remove_var("GIT_CONFIG_GLOBAL");
+    }
 
     assert_eq!(config["user.name"], "Global Identity");
 
     // An include directive is where the engine stops and lets the command line answer.
     std::fs::write(&global, "[include]\n\tpath = elsewhere\n").unwrap();
-    std::env::set_var("GIT_CONFIG_GLOBAL", &global);
+    // SAFETY: Serialised via `ENV_LOCK`.
+    unsafe {
+        std::env::set_var("GIT_CONFIG_GLOBAL", &global);
+    }
     let error = config::config_list(&engine, config::ConfigLocation::Global).unwrap_err();
-    std::env::remove_var("GIT_CONFIG_GLOBAL");
+    // SAFETY: Serialised via `ENV_LOCK`.
+    unsafe {
+        std::env::remove_var("GIT_CONFIG_GLOBAL");
+    }
 
     assert_eq!(error.kind, ErrorKind::Unsupported);
 }

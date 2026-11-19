@@ -68,14 +68,20 @@ fn reports_absent_configuration_as_none() {
     // see none of them for "absent" to be observable. Environment variables are process-wide, so
     // the override is taken under a lock and restored before returning.
     let _guard = ENV_LOCK.lock().unwrap();
-    std::env::set_var("GIT_CONFIG_GLOBAL", repo.path().join("no-such-gitconfig"));
-    std::env::set_var("GIT_CONFIG_NOSYSTEM", "1");
+    // SAFETY: Serialised across tests in this binary via `ENV_LOCK`; no other thread mutates these vars.
+    unsafe {
+        std::env::set_var("GIT_CONFIG_GLOBAL", repo.path().join("no-such-gitconfig"));
+        std::env::set_var("GIT_CONFIG_NOSYSTEM", "1");
+    }
 
     let engine = open(&repo);
     let snapshot = config::read_config(&engine).unwrap();
 
-    std::env::remove_var("GIT_CONFIG_GLOBAL");
-    std::env::remove_var("GIT_CONFIG_NOSYSTEM");
+    // SAFETY: Serialised via `ENV_LOCK`.
+    unsafe {
+        std::env::remove_var("GIT_CONFIG_GLOBAL");
+        std::env::remove_var("GIT_CONFIG_NOSYSTEM");
+    }
 
     assert_eq!(snapshot.user_name, None);
     assert_eq!(snapshot.user_email, None);
@@ -105,14 +111,20 @@ fn resolves_remote_fields_independently_across_config_files() {
     .unwrap();
 
     let _guard = ENV_LOCK.lock().unwrap();
-    std::env::set_var("GIT_CONFIG_GLOBAL", &global_config);
-    std::env::set_var("GIT_CONFIG_NOSYSTEM", "1");
+    // SAFETY: Serialised across tests in this binary via `ENV_LOCK`; no other thread mutates these vars.
+    unsafe {
+        std::env::set_var("GIT_CONFIG_GLOBAL", &global_config);
+        std::env::set_var("GIT_CONFIG_NOSYSTEM", "1");
+    }
 
     let engine = open(&repo);
     let snapshot = config::read_config(&engine).unwrap();
 
-    std::env::remove_var("GIT_CONFIG_GLOBAL");
-    std::env::remove_var("GIT_CONFIG_NOSYSTEM");
+    // SAFETY: Serialised via `ENV_LOCK`.
+    unsafe {
+        std::env::remove_var("GIT_CONFIG_GLOBAL");
+        std::env::remove_var("GIT_CONFIG_NOSYSTEM");
+    }
 
     assert_eq!(snapshot.remotes.len(), 1);
     assert_eq!(

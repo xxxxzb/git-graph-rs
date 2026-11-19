@@ -1,15 +1,17 @@
 //! 模态确认/输入对话框与右键上下文菜单构建。
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use ely_core::buttons::{Button, ButtonVariant};
-use ely_core::forms::{Checkbox, Input, TextInput};
+use ely_core::buttons::{Button, ButtonVariant, SegmentedControl};
+use ely_core::feedback::Callout;
+use ely_core::forms::{Checkbox, Choice, Input, Select, TextInput};
 use ely_core::menus::{Menu, MenuItem};
 use ely_core::overlays::{ConfirmDialog, Dialog, PromptDialog};
 use ely_core::primitives::{IconName, Severity};
-use ely_core::theme::{ActiveTheme, TextSize};
+use ely_core::theme::{ActiveTheme, ControlSize, TextSize};
 use git_graph_core::types::{GitCommit, UNCOMMITTED};
-use git_graph_ops::{ResetMode, SafetyWarning};
+use git_graph_ops::{PushForceMode, PushOptions, ResetMode, SafetyWarning};
 use gpui::{
     AnyElement, App, Entity, IntoElement, ParentElement, Pixels, Point, SharedString, Styled,
     Window, div,
@@ -84,6 +86,18 @@ pub enum ActiveModal {
         message_input: Entity<TextInput>,
         include_untracked: bool,
     },
+    PushBranch {
+        repo_path: PathBuf,
+        local_branches: Vec<String>,
+        selected_branch: String,
+        upstreams: BTreeMap<String, Option<String>>,
+        remotes: Vec<String>,
+        selected_remote: String,
+        remote_branch_input: Entity<TextInput>,
+        set_upstream: bool,
+        push_tags: bool,
+        force: PushForceMode,
+    },
     SafetyConfirm {
         warning: SafetyWarning,
         confirm_label: SharedString,
@@ -98,6 +112,54 @@ pub enum ActiveModal {
     },
 }
 
+/// 推送分支弹窗的默认表单参数。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushDefaults {
+    pub remote: String,
+    pub remote_branch: String,
+    pub set_upstream: bool,
+}
+
+/// 根据目标分支的 upstream 与仓库 remotes 列表计算推送弹窗默认参数：
+/// - 默认远端优先取该分支 upstream 的 remote，无则优先 `origin`，再否则取首个 remote
+/// - 远程分支名默认与本地分支同名
+/// - 无 upstream 时自动默认勾选 `-u`（设置上游追踪）
+pub fn compute_push_defaults(
+    local_branch: &str,
+    upstream: Option<&str>,
+    remotes: &[String],
+) -> PushDefaults {
+    let fallback_remote = || {
+        remotes
+            .iter()
+            .find(|r| r.as_str() == "origin")
+            .cloned()
+            .or_else(|| remotes.first().cloned())
+            .unwrap_or_default()
+    };
+
+    let upstream_remote = upstream.and_then(|up| {
+        // 优先最长前缀匹配已知 remote，兼容名称中包含 `/` 的 remote
+        remotes
+            .iter()
+            .filter(|r| up.starts_with(r.as_str()) && up[r.len()..].starts_with('/'))
+            .max_by_key(|r| r.len())
+            .cloned()
+            .or_else(|| {
+                up.split_once('/')
+                    .map(|(r, _)| r.to_string())
+                    .filter(|r| remotes.is_empty() || remotes.iter().any(|known| known == r))
+            })
+    });
+
+    let remote = upstream_remote.unwrap_or_else(fallback_remote);
+    PushDefaults {
+        remote,
+        remote_branch: local_branch.to_string(),
+        set_upstream: upstream.is_none(),
+    }
+}
+
 /// 右键提交或 Ref 胶囊后激活的上下文菜单请求。
 #[derive(Clone)]
 pub struct ContextMenuState {
@@ -107,6 +169,7 @@ pub struct ContextMenuState {
     pub commit: GitCommit,
     pub focused_branch: Option<String>,
     pub focused_tag: Option<String>,
+    pub current_branch: Option<String>,
 }
 
 /// 构造右键上下文菜单。
@@ -137,7 +200,11 @@ pub fn build_commit_context_menu(
     let mut menu = Menu::new();
 
     // 若右键点在特定本地分支胶囊上，置顶分支操作
+    let mut listed_push_current = false;
     if let Some(branch) = &ctx_state.focused_branch {
+        if ctx_state.current_branch.as_deref() == Some(branch.as_str()) {
+            listed_push_current = true;
+        }
         menu = menu
             .item(
                 MenuItem::new(format!("检出分支 {branch}"))
@@ -149,6 +216,21 @@ pub fn build_commit_context_menu(
                         move |_, cx| {
                             app.update(cx, |this, cx| {
                                 this.request_checkout_branch(repo.clone(), branch.clone(), cx);
+                            })
+                            .ok();
+                        }
+                    }),
+            )
+            .item(
+                MenuItem::new(format!("推送分支 \"{branch}\" 到远程…"))
+                    .icon(IconName::CloudUpload)
+                    .on_click({
+                        let app = app_entity.clone();
+                        let repo = repo_path.clone();
+                        let branch = branch.clone();
+                        move |window, cx| {
+                            app.update(cx, |this, cx| {
+                                this.open_push_branch_modal(repo.clone(), branch.clone(), window, cx);
                             })
                             .ok();
                         }
@@ -172,23 +254,72 @@ pub fn build_commit_context_menu(
             .separator();
     } else if !commit.heads.is_empty() {
         for branch in &commit.heads {
-            menu = menu.item(
-                MenuItem::new(format!("检出分支 {branch}"))
-                    .icon(IconName::GitBranch)
+            if ctx_state.current_branch.as_deref() == Some(branch.as_str()) {
+                listed_push_current = true;
+            }
+            menu = menu
+                .item(
+                    MenuItem::new(format!("检出分支 {branch}"))
+                        .icon(IconName::GitBranch)
+                        .on_click({
+                            let app = app_entity.clone();
+                            let repo = repo_path.clone();
+                            let branch = branch.clone();
+                            move |_, cx| {
+                                app.update(cx, |this, cx| {
+                                    this.request_checkout_branch(repo.clone(), branch.clone(), cx);
+                                })
+                                .ok();
+                            }
+                        }),
+                )
+                .item(
+                    MenuItem::new(format!("推送分支 \"{branch}\" 到远程…"))
+                        .icon(IconName::CloudUpload)
+                        .on_click({
+                            let app = app_entity.clone();
+                            let repo = repo_path.clone();
+                            let branch = branch.clone();
+                            move |window, cx| {
+                                app.update(cx, |this, cx| {
+                                    this.open_push_branch_modal(
+                                        repo.clone(),
+                                        branch.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                })
+                                .ok();
+                            }
+                        }),
+                );
+        }
+        menu = menu.separator();
+    }
+
+    if !listed_push_current && let Some(cur_branch) = &ctx_state.current_branch {
+        menu = menu
+            .item(
+                MenuItem::new(format!("推送当前分支 \"{cur_branch}\" 到远程…"))
+                    .icon(IconName::CloudUpload)
                     .on_click({
                         let app = app_entity.clone();
                         let repo = repo_path.clone();
-                        let branch = branch.clone();
-                        move |_, cx| {
+                        let branch = cur_branch.clone();
+                        move |window, cx| {
                             app.update(cx, |this, cx| {
-                                this.request_checkout_branch(repo.clone(), branch.clone(), cx);
+                                this.open_push_branch_modal(
+                                    repo.clone(),
+                                    branch.clone(),
+                                    window,
+                                    cx,
+                                );
                             })
                             .ok();
                         }
                     }),
-            );
-        }
-        menu = menu.separator();
+            )
+            .separator();
     }
 
     if let Some(tag) = &ctx_state.focused_tag {
@@ -626,6 +757,292 @@ pub fn render_active_modal(
             })
             .into_any_element()
         }
+        ActiveModal::PushBranch {
+            repo_path,
+            local_branches,
+            selected_branch,
+            upstreams: _,
+            remotes,
+            selected_remote,
+            remote_branch_input,
+            set_upstream,
+            push_tags,
+            force,
+        } => {
+            let repo = repo_path.clone();
+            let theme = cx.theme();
+            let remote_branch_val = remote_branch_input.read(cx).text().trim().to_string();
+            let branch_valid = !selected_branch.is_empty()
+                && !selected_remote.is_empty()
+                && !remote_branch_val.is_empty()
+                && !remote_branch_val.contains(char::is_whitespace)
+                && !remote_branch_val.starts_with('-');
+
+            let branch_choices: Vec<Choice> = if local_branches.is_empty() {
+                vec![Choice::new(selected_branch.clone(), selected_branch.clone())]
+            } else {
+                local_branches
+                    .iter()
+                    .map(|b| Choice::new(b.clone(), b.clone()))
+                    .collect()
+            };
+            let branch_select = Select::new("push-local-branch-select", branch_choices)
+                .size(ControlSize::Sm)
+                .selected(selected_branch.clone())
+                .on_change({
+                    let app = app_entity.clone();
+                    move |value, _, cx| {
+                        let next_branch = value.to_string();
+                        app.update(cx, |this, cx| {
+                            if let Some(ActiveModal::PushBranch {
+                                selected_branch,
+                                upstreams,
+                                remotes,
+                                selected_remote,
+                                remote_branch_input,
+                                set_upstream,
+                                ..
+                            }) = &mut this.modal
+                            {
+                                *selected_branch = next_branch.clone();
+                                let upstream = upstreams.get(&next_branch).and_then(|u| u.as_deref());
+                                let defaults =
+                                    compute_push_defaults(&next_branch, upstream, remotes);
+                                *selected_remote = defaults.remote;
+                                *set_upstream = defaults.set_upstream;
+                                remote_branch_input.update(cx, |input, cx| {
+                                    input.set_text(defaults.remote_branch, cx);
+                                });
+                                cx.notify();
+                            }
+                        })
+                        .ok();
+                    }
+                });
+
+            let remote_choices: Vec<Choice> = remotes
+                .iter()
+                .map(|r| Choice::new(r.clone(), r.clone()))
+                .collect();
+            let remote_select = Select::new("push-remote-select", remote_choices)
+                .size(ControlSize::Sm)
+                .placeholder("无可用远程仓库")
+                .disabled(remotes.is_empty())
+                .selected(selected_remote.clone())
+                .on_change({
+                    let app = app_entity.clone();
+                    move |value, _, cx| {
+                        let next_remote = value.to_string();
+                        app.update(cx, |this, cx| {
+                            if let Some(ActiveModal::PushBranch {
+                                selected_remote, ..
+                            }) = &mut this.modal
+                            {
+                                *selected_remote = next_remote;
+                                cx.notify();
+                            }
+                        })
+                        .ok();
+                    }
+                });
+
+            let force_key: SharedString = match force {
+                PushForceMode::None => "none",
+                PushForceMode::ForceWithLease => "lease",
+                PushForceMode::Force => "force",
+            }
+            .into();
+            let force_control = SegmentedControl::new("push-force-mode", force_key)
+                .size(ControlSize::Sm)
+                .segment("none", "关闭", None)
+                .segment("lease", "安全强推 (--force-with-lease)", None)
+                .segment("force", "强制覆盖 (--force)", None)
+                .on_change({
+                    let app = app_entity.clone();
+                    move |val, _, cx| {
+                        let mode = match val.as_ref() {
+                            "lease" => PushForceMode::ForceWithLease,
+                            "force" => PushForceMode::Force,
+                            _ => PushForceMode::None,
+                        };
+                        app.update(cx, |this, cx| {
+                            if let Some(ActiveModal::PushBranch { force, .. }) = &mut this.modal {
+                                *force = mode;
+                                cx.notify();
+                            }
+                        })
+                        .ok();
+                    }
+                });
+
+            let warning_callout: Option<AnyElement> = if remotes.is_empty() {
+                Some(
+                    Callout::new(Severity::Warning)
+                        .title("未配置远程仓库")
+                        .child("请先为当前仓库添加 remote 后再执行推送。")
+                        .into_any_element(),
+                )
+            } else {
+                match force {
+                    PushForceMode::None => None,
+                    PushForceMode::ForceWithLease => Some(
+                        Callout::new(Severity::Warning)
+                            .title("已启用 --force-with-lease")
+                            .child("仅在远端分支未发生他人新提交时覆盖，比 --force 更安全。")
+                            .into_any_element(),
+                    ),
+                    PushForceMode::Force => Some(
+                        Callout::new(Severity::Danger)
+                            .title("高危提醒：已启用 --force 强制覆盖")
+                            .child("将强制覆盖远端分支历史，可能导致他人的提交丢失且无法恢复！")
+                            .into_any_element(),
+                    ),
+                }
+            };
+
+            let field_label = |text: &'static str| {
+                div()
+                    .text_size(theme.text_size(TextSize::Sm))
+                    .text_color(theme.colors.fg_muted)
+                    .child(text)
+            };
+
+            let submit_local = selected_branch.clone();
+            let submit_remote = selected_remote.clone();
+            let submit_upstream = *set_upstream;
+            let submit_tags = *push_tags;
+            let submit_force = *force;
+
+            Dialog::new("push-branch-dialog", "推送分支到远程", close_fn)
+                .focus_first(remote_branch_input.read(cx).focus().clone())
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(field_label("本地分支"))
+                                .child(branch_select),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(field_label("目标远端 (Remote)"))
+                                .child(remote_select),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(field_label("远程分支名"))
+                                .child(Input::new(remote_branch_input)),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .child(
+                                    Checkbox::new("push-set-upstream", *set_upstream)
+                                        .label("设置上游追踪 (-u)")
+                                        .on_change({
+                                            let app = app_entity.clone();
+                                            move |checked, _, cx| {
+                                                app.update(cx, |this, cx| {
+                                                    if let Some(ActiveModal::PushBranch {
+                                                        set_upstream,
+                                                        ..
+                                                    }) = &mut this.modal
+                                                    {
+                                                        *set_upstream = checked;
+                                                        cx.notify();
+                                                    }
+                                                })
+                                                .ok();
+                                            }
+                                        }),
+                                )
+                                .child(
+                                    Checkbox::new("push-tags", *push_tags)
+                                        .label("同时推送标签 (--tags)")
+                                        .on_change({
+                                            let app = app_entity.clone();
+                                            move |checked, _, cx| {
+                                                app.update(cx, |this, cx| {
+                                                    if let Some(ActiveModal::PushBranch {
+                                                        push_tags,
+                                                        ..
+                                                    }) = &mut this.modal
+                                                    {
+                                                        *push_tags = checked;
+                                                        cx.notify();
+                                                    }
+                                                })
+                                                .ok();
+                                            }
+                                        }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(field_label("强制推送模式"))
+                                .child(force_control),
+                        )
+                        .children(warning_callout),
+                )
+                .action(|close| {
+                    Button::new("push-branch-cancel", "取消")
+                        .variant(ButtonVariant::Ghost)
+                        .on_click(move |_, window, cx| close(window, cx))
+                })
+                .action({
+                    let app = app_entity.clone();
+                    let remote_branch_input = remote_branch_input.clone();
+                    move |close| {
+                        let btn = Button::new("push-branch-submit", "推送")
+                            .variant(if submit_force == PushForceMode::Force {
+                                ButtonVariant::Danger
+                            } else {
+                                ButtonVariant::Primary
+                            })
+                            .disabled(!branch_valid);
+                        btn.on_click(move |_, window, cx| {
+                            let remote_branch =
+                                remote_branch_input.read(cx).text().trim().to_string();
+                            if submit_local.is_empty()
+                                || submit_remote.is_empty()
+                                || remote_branch.is_empty()
+                            {
+                                return;
+                            }
+                            let opts = PushOptions {
+                                local_branch: submit_local.clone(),
+                                remote: submit_remote.clone(),
+                                remote_branch,
+                                set_upstream: submit_upstream,
+                                push_tags: submit_tags,
+                                force: submit_force,
+                            };
+                            close(window, cx);
+                            app.update(cx, |this, cx| {
+                                this.run_push_branch(repo.clone(), opts.clone(), cx);
+                            })
+                            .ok();
+                        })
+                    }
+                })
+                .into_any_element()
+        }
         ActiveModal::SafetyConfirm {
             warning,
             confirm_label,
@@ -690,4 +1107,38 @@ fn parse_stash_index(selector: &str) -> Option<usize> {
         .strip_prefix("stash@{")
         .and_then(|s| s.strip_suffix('}'))
         .and_then(|n| n.parse::<usize>().ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn push_defaults_auto_checks_set_upstream_when_missing() {
+        let remotes = vec!["fork".to_string(), "origin".to_string()];
+
+        // 1. 无 upstream 时自动勾选 -u，remote 优先 origin
+        let no_up = compute_push_defaults("feat/new-ui", None, &remotes);
+        assert_eq!(no_up.remote, "origin");
+        assert_eq!(no_up.remote_branch, "feat/new-ui");
+        assert!(no_up.set_upstream);
+
+        // 2. 已有 upstream 时不自动勾选 -u，remote 优先取 upstream 的 remote
+        let with_up = compute_push_defaults("feat/new-ui", Some("fork/feat/new-ui"), &remotes);
+        assert_eq!(with_up.remote, "fork");
+        assert_eq!(with_up.remote_branch, "feat/new-ui");
+        assert!(!with_up.set_upstream);
+
+        // 3. 无 origin 时回退到列表首个 remote
+        let only_upstream = vec!["upstream".to_string()];
+        let fallback = compute_push_defaults("main", None, &only_upstream);
+        assert_eq!(fallback.remote, "upstream");
+        assert!(fallback.set_upstream);
+
+        // 4. 无任何 remote 时 remote 为空且仍自动勾选 -u
+        let empty = compute_push_defaults("main", None, &[]);
+        assert_eq!(empty.remote, "");
+        assert_eq!(empty.remote_branch, "main");
+        assert!(empty.set_upstream);
+    }
 }

@@ -11,13 +11,13 @@ use git_graph_core::types::{
     GitRepoInfo, UNCOMMITTED,
 };
 use git_graph_core::{ErrorKind, details, diff, status};
-use git_graph_layout::{GraphLayout, compute_layout};
-use git_graph_ops::RepoWatcher;
-use gpui::{Image, Task, UniformListScrollHandle};
+use git_graph_layout::GraphLayout;
+use git_graph_ops::{BranchSyncStatus, GitCli, RepoWatcher};
+use gpui::{Image, SharedString, Task, UniformListScrollHandle};
 
 use crate::diff_parser::{ParsedDiff, parse_unified_diff, stretches_from_texts};
 use crate::state::{
-    FilterCriteria, commit_to_node, compute_search_layout, filter_commit_indices,
+    FilterCriteria, commit_to_node, compute_graph_layout, filter_commit_indices,
     image_format_for_path, matches_author_filter, matches_commit_query, repo_display_name,
 };
 
@@ -65,6 +65,7 @@ pub struct RepoSnapshot {
     pub more_available: bool,
     pub scm_changes: Vec<status::ScmChange>,
     pub uncommitted_count: usize,
+    pub sync_status: Option<BranchSyncStatus>,
 }
 
 /// 后台全历史搜索输出结果。
@@ -114,7 +115,9 @@ pub struct RepoTabState {
     pub loading_more: bool,
     pub loading_details: bool,
     pub loading_diff: bool,
-    pub fetching: bool,
+    pub sync_status: Option<BranchSyncStatus>,
+    pub syncing: bool,
+    pub sync_action_label: Option<SharedString>,
     pub error: Option<String>,
 
     pub graph_scroll: UniformListScrollHandle,
@@ -162,7 +165,9 @@ impl RepoTabState {
             loading_more: false,
             loading_details: false,
             loading_diff: false,
-            fetching: false,
+            sync_status: None,
+            syncing: false,
+            sync_action_label: None,
             error: None,
             graph_scroll: UniformListScrollHandle::new(),
             _watcher: None,
@@ -208,22 +213,31 @@ impl RepoTabState {
             .collect()
     }
 
+    /// 当前视图是否需要截断指向列表外部的悬空连线（搜索、分支/作者筛选或已加载至底端）。
+    pub fn should_truncate_missing_parents(&self) -> bool {
+        self.is_search_active()
+            || self.filter.branch.is_some()
+            || self.filter.author.is_some()
+            || !self.more_available
+    }
+
     /// 应用搜索关键词过滤并重算可见行的泳道布局。
     pub fn recompute_visible_rows(&mut self) {
+        let truncate = self.should_truncate_missing_parents();
         if self.is_search_active() {
             if let Some(results) = &self.search_results {
                 let nodes: Vec<_> = results.iter().map(commit_to_node).collect();
-                self.layout = compute_search_layout(&nodes, self.head_hash.as_deref());
+                self.layout = compute_graph_layout(&nodes, self.head_hash.as_deref(), true);
                 return;
             }
-            // 后台全历史搜索尚未返回时，先基于已加载页即时预过滤并采用干净的单节点布局
+            // 后台全历史搜索尚未返回时，先基于已加载页即时预过滤并保留可见父子连线、截断悬空线
             let indices = filter_commit_indices(&self.all_commits, &self.filter.search_query);
             let nodes: Vec<_> = indices
                 .iter()
                 .filter_map(|&idx| self.all_commits.get(idx).map(commit_to_node))
                 .collect();
             self.filtered_indices = indices;
-            self.layout = compute_search_layout(&nodes, self.head_hash.as_deref());
+            self.layout = compute_graph_layout(&nodes, self.head_hash.as_deref(), true);
             return;
         }
 
@@ -233,7 +247,7 @@ impl RepoTabState {
             .filter_map(|&idx| self.all_commits.get(idx).map(commit_to_node))
             .collect();
         self.filtered_indices = indices;
-        self.layout = compute_layout(&nodes, self.head_hash.as_deref());
+        self.layout = compute_graph_layout(&nodes, self.head_hash.as_deref(), truncate);
     }
 
     /// 查找指定 hash 在当前可见行中的索引。
@@ -408,9 +422,10 @@ pub fn execute_history_search(
     })
 }
 
-/// 在后台线程加载仓库图谱、分支/作者信息与工作区状态。
+/// 在后台线程加载仓库图谱、分支/作者信息、工作区与远程同步状态。
 pub fn load_repo_snapshot(
     engine: &Engine,
+    cli: Option<&GitCli>,
     filter: &FilterCriteria,
     max_commits: u32,
 ) -> Result<RepoSnapshot, String> {
@@ -423,6 +438,13 @@ pub fn load_repo_snapshot(
     }
     let scm_changes = engine.status().unwrap_or_default();
     let uncommitted_count = status::count_changes(engine.repo(), true).unwrap_or(scm_changes.len());
+    let sync_status = cli
+        .and_then(|c| c.branch_sync_status(engine.root()).ok())
+        .or_else(|| {
+            GitCli::new()
+                .ok()
+                .and_then(|c| c.branch_sync_status(engine.root()).ok())
+        });
 
     Ok(RepoSnapshot {
         info,
@@ -432,6 +454,7 @@ pub fn load_repo_snapshot(
         more_available: data.more_commits_available,
         scm_changes,
         uncommitted_count,
+        sync_status,
     })
 }
 
@@ -927,15 +950,60 @@ mod tests {
         tab.search_results = Some(out.commits);
         tab.recompute_visible_rows();
 
+        // 搜索态命中了 hashes[1] 与 hashes[0]；当搜索结果携带真实 parents 时应保留父子连线，并截断列表外悬空线
         assert_eq!(tab.visible_commit_count(), 2);
         assert!(tab.find_commit(&hashes[0]).is_some());
         assert!(tab.visible_index_of(&hashes[0]).is_some());
-        assert!(tab.layout.rows.iter().all(|r| r.segments.is_empty()));
+        assert!(tab.should_truncate_missing_parents());
+
+        // 验证预过滤或带真实父子关系的筛选态：保留可见父子连线且截断指向列表外提交的悬空线
+        tab.search_results = Some(
+            engine
+                .graph(&GraphOptions {
+                    max_commits: 4,
+                    ..Default::default()
+                })
+                .unwrap()
+                .commits
+                .into_iter()
+                .filter(|c| c.hash == hashes[2] || c.hash == hashes[1])
+                .collect(),
+        );
+        tab.recompute_visible_rows();
+        assert_eq!(tab.layout.rows.len(), 2);
+        // hashes[2] -> hashes[1] 连线应完好保留，hashes[1] -> hashes[0]（不在可见列表）应被截断
+        assert!(
+            tab.layout.rows[0]
+                .segments
+                .iter()
+                .any(|s| s.kind == git_graph_layout::SegmentKind::NodeToBottom)
+        );
+        assert!(
+            tab.layout.rows[1]
+                .segments
+                .iter()
+                .any(|s| s.kind == git_graph_layout::SegmentKind::TopToNode)
+        );
+        assert!(
+            !tab.layout.rows[1]
+                .segments
+                .iter()
+                .any(|s| s.kind == git_graph_layout::SegmentKind::NodeToBottom)
+        );
 
         // 清空搜索恢复常规分页图谱
         tab.filter.search_query.clear();
         tab.clear_search_state();
         assert_eq!(tab.visible_commit_count(), 2);
         assert!(tab.find_commit(&hashes[0]).is_none());
+
+        // 分支/作者筛选或 !more_available 均会开启 truncate_missing_parents
+        tab.more_available = true;
+        assert!(!tab.should_truncate_missing_parents());
+        tab.filter.branch = Some("main".to_string());
+        assert!(tab.should_truncate_missing_parents());
+        tab.filter.branch = None;
+        tab.filter.author = Some("Alice".to_string());
+        assert!(tab.should_truncate_missing_parents());
     }
 }

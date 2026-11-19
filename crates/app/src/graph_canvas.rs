@@ -53,6 +53,7 @@ pub struct GraphCellStyle {
     pub row_bg: Hsla,
     pub muted_color: Hsla,
     pub stash_color: Hsla,
+    pub border_color: Hsla,
 }
 
 /// 渲染单行的图形列单元格。
@@ -65,57 +66,62 @@ pub fn paint_graph_cell(row: RowLayout, style: GraphCellStyle) -> AnyElement {
         row_bg,
         muted_color,
         stash_color,
+        border_color,
     } = style;
     canvas(
         |_, _, _| {},
         move |bounds: Bounds<Pixels>, _, window, _| {
-            let left_pad = px(10.0);
-            let lane_x = |lane: usize| -> Pixels {
-                bounds.origin.x + left_pad + lane_width * (lane as f32 + 0.5)
-            };
-            let top = bounds.origin.y;
-            let mid = bounds.origin.y + bounds.size.height * 0.5;
-            let bottom = bounds.origin.y + bounds.size.height;
-            let stroke_width = px(1.8);
-
-            // 1. 先绘制所有泳道连接线
-            for seg in &row.segments {
-                let color = if seg.dashed {
-                    muted_color
-                } else {
-                    lane_color(seg.color_index, dark)
+            window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
+                let left_pad = px(10.0);
+                let lane_x = |lane: usize| -> Pixels {
+                    bounds.origin.x + left_pad + lane_width * (lane as f32 + 0.5)
                 };
-                paint_segment(
-                    window,
-                    seg,
-                    lane_x,
-                    top,
-                    mid,
-                    bottom,
-                    stroke_width,
-                    color,
-                );
-            }
+                let top = bounds.origin.y;
+                let mid = bounds.origin.y + bounds.size.height * 0.5;
+                let bottom = bounds.origin.y + bounds.size.height;
+                let stroke_width = px(1.8);
 
-            // 2. 再绘制提交圆点（覆盖在连接线之上）
-            let cx_pt = point(lane_x(row.lane), mid);
-            let node_color = lane_color(row.color_index, dark);
-            paint_node(
-                window,
-                cx_pt,
-                row.node_kind,
-                row.is_head,
-                row.is_merge,
-                node_color,
-                row_bg,
-                muted_color,
-                stash_color,
-            );
+                // 1. 先绘制所有泳道连接线
+                for seg in &row.segments {
+                    let color = if seg.dashed {
+                        muted_color
+                    } else {
+                        lane_color(seg.color_index, dark)
+                    };
+                    paint_segment(
+                        window,
+                        seg,
+                        lane_x,
+                        top,
+                        mid,
+                        bottom,
+                        stroke_width,
+                        color,
+                    );
+                }
+
+                // 2. 再绘制提交圆点（覆盖在连接线之上）
+                let cx_pt = point(lane_x(row.lane), mid);
+                let node_color = lane_color(row.color_index, dark);
+                paint_node(
+                    window,
+                    cx_pt,
+                    row.node_kind,
+                    row.is_head,
+                    row.is_merge,
+                    node_color,
+                    row_bg,
+                    muted_color,
+                    stash_color,
+                );
+            });
         },
     )
     .flex_none()
     .w(col_width)
     .h(row_height)
+    .border_r_1()
+    .border_color(border_color)
     .overflow_hidden()
     .into_any_element()
 }

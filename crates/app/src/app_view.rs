@@ -1,5 +1,6 @@
 //! 主应用视图 `GitGraphApp`：macOS 融合标题栏、多仓库 Tab、异步调度、写操作、文件监听与全局壳层。
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -18,16 +19,18 @@ use ely_git::DiffLayout;
 use git_graph_core::api::Engine;
 use git_graph_core::types::{GitCommit, UNCOMMITTED};
 use git_graph_ops::{
-    GitCli, RepoWatcher, ResetMode, WatchEvent, check_checkout_safety, check_reset_safety,
+    BranchSyncStatus, GitCli, PushForceMode, PushOptions, RepoWatcher, ResetMode, WatchEvent,
+    check_checkout_safety, check_reset_safety,
 };
 use gpui::{
-    AnyElement, App, Axis, Context, Entity, FocusHandle, InteractiveElement, IntoElement,
+    AnyElement, Axis, Context, Entity, FocusHandle, InteractiveElement, IntoElement,
     ParentElement, PathPromptOptions, Pixels, Point, Render, ScrollStrategy, SharedString,
     Styled, Subscription, Window, div, prelude::*, px,
 };
 
 use crate::modals::{
-    ActiveModal, ContextMenuState, PendingWriteOp, build_commit_context_menu, render_active_modal,
+    ActiveModal, ContextMenuState, PendingWriteOp, build_commit_context_menu,
+    compute_push_defaults, render_active_modal,
 };
 use crate::repo_tab::{
     FileSection, RepoTabState, SelectedFile, execute_history_search, load_commit_details,
@@ -37,7 +40,9 @@ use crate::state::{
     PersistedState, repo_display_name, save_persisted_state, short_hash,
 };
 use crate::ui_details::render_details_pane;
-use crate::ui_graph::{ResizeCol, render_filter_toolbar, render_graph_table};
+use crate::ui_graph::{
+    ResizeCol, SyncButtonAction, render_filter_toolbar, render_graph_table, sync_button_spec,
+};
 
 gpui::actions!(
     git_graph_app,
@@ -327,6 +332,7 @@ impl GitGraphApp {
     }
 
     pub fn load_tab_graph(&mut self, tab_id: u64, soft: bool, cx: &mut Context<Self>) {
+        let cli = self.cli.clone();
         let Some(tab) = self.tab_by_id_mut(tab_id) else {
             return;
         };
@@ -343,7 +349,9 @@ impl GitGraphApp {
 
         cx.spawn(async move |weak, cx| {
             let res = cx
-                .background_spawn(async move { load_repo_snapshot(&engine, &filter, max_commits) })
+                .background_spawn(async move {
+                    load_repo_snapshot(&engine, cli.as_ref(), &filter, max_commits)
+                })
                 .await;
 
             weak.update(cx, |this, cx| {
@@ -365,6 +373,7 @@ impl GitGraphApp {
                         tab.more_available = snap.more_available;
                         tab.scm_changes = snap.scm_changes;
                         tab.uncommitted_count = snap.uncommitted_count;
+                        tab.sync_status = snap.sync_status;
                         tab.recompute_visible_rows();
                         let should_research = !soft && tab.is_search_active();
 
@@ -865,7 +874,10 @@ impl GitGraphApp {
 
     pub fn set_column_width(&mut self, col: ResizeCol, width: f32, cx: &mut Context<Self>) {
         match col {
-            ResizeCol::Graph => self.persisted.column_widths.graph = width,
+            ResizeCol::Graph => {
+                self.persisted.column_widths.graph = width;
+                self.persisted.column_widths.graph_manual = true;
+            }
             ResizeCol::Date => self.persisted.column_widths.date = width,
             ResizeCol::Author => self.persisted.column_widths.author = width,
             ResizeCol::Commit => self.persisted.column_widths.commit = width,
@@ -895,6 +907,12 @@ impl GitGraphApp {
         position: Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
+        let current_branch = self
+            .tabs
+            .iter()
+            .find(|t| t.path == repo_path)
+            .or_else(|| self.active_tab())
+            .and_then(|t| t.info.as_ref().and_then(|i| i.head.clone()));
         self.next_ctx_request_id += 1;
         self.context_menu = Some(ContextMenuState {
             request_id: self.next_ctx_request_id,
@@ -903,6 +921,7 @@ impl GitGraphApp {
             commit,
             focused_branch,
             focused_tag,
+            current_branch,
         });
         cx.notify();
     }
@@ -957,6 +976,78 @@ impl GitGraphApp {
         cx.notify();
     }
 
+    pub fn open_push_branch_modal(
+        &mut self,
+        repo_path: PathBuf,
+        target_branch: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(cli) = self.ensure_cli(cx) else {
+            return;
+        };
+        let mut local_branches = self
+            .tabs
+            .iter()
+            .find(|t| t.path == repo_path)
+            .or_else(|| self.active_tab())
+            .and_then(|t| t.info.as_ref().map(|i| i.branches.clone()))
+            .unwrap_or_default();
+        if !local_branches.iter().any(|b| b == &target_branch) {
+            local_branches.insert(0, target_branch.clone());
+        }
+
+        let remote_branch_input = cx.new(|cx| TextInput::new(window, cx).placeholder("远程分支名"));
+        remote_branch_input.update(cx, |input, cx| {
+            input.set_text(target_branch.clone(), cx);
+        });
+
+        let repo_bg = repo_path.clone();
+        let branches_bg = local_branches.clone();
+        let target_bg = target_branch.clone();
+        cx.spawn(async move |weak, cx| {
+            let (remotes, upstreams) = cx
+                .background_spawn(async move {
+                    let remotes = cli.list_remotes(&repo_bg).unwrap_or_default();
+                    let mut upstreams = BTreeMap::new();
+                    if branches_bg.len() <= 64 {
+                        for b in &branches_bg {
+                            let up = cli.branch_upstream(&repo_bg, b).ok().flatten();
+                            upstreams.insert(b.clone(), up);
+                        }
+                    } else {
+                        let up = cli.branch_upstream(&repo_bg, &target_bg).ok().flatten();
+                        upstreams.insert(target_bg, up);
+                    }
+                    (remotes, upstreams)
+                })
+                .await;
+
+            weak.update(cx, |this, cx| {
+                let upstream = upstreams.get(&target_branch).and_then(|u| u.as_deref());
+                let defaults = compute_push_defaults(&target_branch, upstream, &remotes);
+                remote_branch_input.update(cx, |input, cx| {
+                    input.set_text(defaults.remote_branch.clone(), cx);
+                });
+                this.modal = Some(ActiveModal::PushBranch {
+                    repo_path,
+                    local_branches,
+                    selected_branch: target_branch,
+                    upstreams,
+                    remotes,
+                    selected_remote: defaults.remote,
+                    remote_branch_input,
+                    set_upstream: defaults.set_upstream,
+                    push_tags: false,
+                    force: PushForceMode::None,
+                });
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /* ---------- 后台写操作与防数据丢失安全检查 ---------- */
 
     fn ensure_cli(&self, cx: &mut Context<Self>) -> Option<GitCli> {
@@ -973,39 +1064,146 @@ impl GitGraphApp {
         }
     }
 
-    pub fn run_fetch_active(&mut self, cx: &mut Context<Self>) {
+    pub fn run_sync_or_publish_active(&mut self, cx: &mut Context<Self>) {
         let Some(cli) = self.ensure_cli(cx) else {
             return;
         };
         let Some(tab) = self.active_tab_mut() else {
             return;
         };
-        if tab.fetching {
+        if tab.syncing {
             return;
         }
-        tab.fetching = true;
+        let spec = sync_button_spec(
+            tab.sync_status.as_ref(),
+            tab.syncing,
+            tab.sync_action_label.as_deref(),
+        );
         let tab_id = tab.id;
         let repo_path = tab.path.clone();
-        cx.notify();
 
+        match spec.action {
+            SyncButtonAction::Sync => {
+                tab.syncing = true;
+                tab.sync_action_label = Some("同步中…".into());
+                cx.notify();
+
+                cx.spawn(async move |weak, cx| {
+                    let res = cx
+                        .background_spawn(async move { cli.sync_branch(&repo_path) })
+                        .await;
+                    weak.update(cx, |this, cx| {
+                        if let Some(tab) = this.tab_by_id_mut(tab_id) {
+                            tab.syncing = false;
+                            tab.sync_action_label = None;
+                        }
+                        match res {
+                            Ok(outcome) => {
+                                let detail = match (outcome.pulled, outcome.pushed) {
+                                    (true, true) => Some("已拉取远端更新并推送本地提交。".to_string()),
+                                    (true, false) => Some("已拉取远端更新。".to_string()),
+                                    (false, true) => Some("已推送本地提交到远端。".to_string()),
+                                    (false, false) => Some("本地分支与远端已是最新。".to_string()),
+                                };
+                                this.push_toast(
+                                    format!("已与 {} 同步", outcome.upstream),
+                                    Severity::Success,
+                                    detail,
+                                    cx,
+                                );
+                                this.soft_refresh_tab(tab_id, cx);
+                            }
+                            Err(err) => {
+                                this.push_toast(
+                                    "同步失败（已中止推送）",
+                                    Severity::Danger,
+                                    Some(err.to_string()),
+                                    cx,
+                                );
+                                // pull 失败或出现冲突时立即刷新工作区状态让用户看到冲突
+                                this.soft_refresh_tab(tab_id, cx);
+                            }
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+            SyncButtonAction::Publish { remote, branch } => {
+                tab.syncing = true;
+                tab.sync_action_label = Some("发布中…".into());
+                cx.notify();
+
+                let remote_label = remote.clone();
+                let branch_label = branch.clone();
+                cx.spawn(async move |weak, cx| {
+                    let res = cx
+                        .background_spawn(async move {
+                            cli.publish_branch(&repo_path, &remote, &branch)
+                        })
+                        .await;
+                    weak.update(cx, |this, cx| {
+                        if let Some(tab) = this.tab_by_id_mut(tab_id) {
+                            tab.syncing = false;
+                            tab.sync_action_label = None;
+                        }
+                        match res {
+                            Ok(_) => {
+                                this.push_toast(
+                                    format!("已发布分支 {branch_label} 到 {remote_label}"),
+                                    Severity::Success,
+                                    None,
+                                    cx,
+                                );
+                                this.soft_refresh_tab(tab_id, cx);
+                            }
+                            Err(err) => {
+                                this.push_toast(
+                                    "发布分支失败",
+                                    Severity::Danger,
+                                    Some(err.to_string()),
+                                    cx,
+                                );
+                                this.soft_refresh_tab(tab_id, cx);
+                            }
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+            SyncButtonAction::None => {}
+        }
+    }
+
+    pub fn run_push_branch(
+        &mut self,
+        repo_path: PathBuf,
+        options: PushOptions,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(cli) = self.ensure_cli(cx) else {
+            return;
+        };
+        let repo_for_refresh = repo_path.clone();
+        let target_label = format!(
+            "{} -> {}/{}",
+            options.local_branch, options.remote, options.remote_branch
+        );
         cx.spawn(async move |weak, cx| {
             let res = cx
-                .background_spawn(async move { cli.fetch(&repo_path, None, true) })
+                .background_spawn(async move { cli.push_branch(&repo_path, &options).map(|_| ()) })
                 .await;
             weak.update(cx, |this, cx| {
-                if let Some(tab) = this.tab_by_id_mut(tab_id) {
-                    tab.fetching = false;
-                }
-                match res {
-                    Ok(()) => {
-                        this.push_toast("Fetch 完成", Severity::Success, None, cx);
-                        this.soft_refresh_tab(tab_id, cx);
-                    }
-                    Err(err) => {
-                        this.push_toast("Fetch 失败", Severity::Danger, Some(err.to_string()), cx);
-                    }
-                }
-                cx.notify();
+                this.finish_write_op(
+                    &repo_for_refresh,
+                    format!("已推送 {target_label}"),
+                    "推送分支失败",
+                    res,
+                    cx,
+                );
             })
             .ok();
         })
@@ -1813,8 +2011,9 @@ impl GitGraphApp {
             .into_any_element()
     }
 
-    fn render_status_bar(&self, _cx: &App) -> StatusBar {
+    fn render_status_bar(&self, cx: &Context<Self>) -> StatusBar {
         let mut bar = StatusBar::new();
+        let weak = cx.weak_entity();
         if let Some(tab) = self.active_tab() {
             let branch_label: SharedString = match tab.info.as_ref().and_then(|i| i.head.as_ref())
             {
@@ -1824,12 +2023,40 @@ impl GitGraphApp {
                     None => "空仓库".into(),
                 },
             };
+            bar = bar.left(
+                StatusBarItem::new("status-branch")
+                    .icon(IconName::GitBranch)
+                    .label(branch_label),
+            );
+
+            // 紧挨当前分支右侧：复刻 VS Code 左下角同步 / 发布状态项
+            let show_sync_item = tab.syncing
+                || matches!(
+                    tab.sync_status,
+                    Some(BranchSyncStatus::Synced { .. } | BranchSyncStatus::NoUpstream { .. })
+                );
+            if show_sync_item {
+                let spec = sync_button_spec(
+                    tab.sync_status.as_ref(),
+                    tab.syncing,
+                    tab.sync_action_label.as_deref(),
+                );
+                let mut item = StatusBarItem::new("status-sync")
+                    .icon(spec.icon)
+                    .label(spec.status_bar_label)
+                    .tooltip(spec.tooltip);
+                if !spec.disabled {
+                    let weak_sync = weak.clone();
+                    item = item.on_click(move |_, _, cx| {
+                        weak_sync
+                            .update(cx, |this, cx| this.run_sync_or_publish_active(cx))
+                            .ok();
+                    });
+                }
+                bar = bar.left(item);
+            }
+
             bar = bar
-                .left(
-                    StatusBarItem::new("status-branch")
-                        .icon(IconName::GitBranch)
-                        .label(branch_label),
-                )
                 .left(StatusBarItem::new("status-uncommitted").label(
                     if tab.uncommitted_count > 0 {
                         format!("未提交: {}", tab.uncommitted_count)

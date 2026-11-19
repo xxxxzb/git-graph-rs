@@ -8,11 +8,12 @@ use ely_core::data_display::{Badge, Tone};
 use ely_core::feedback::{EmptyState, ErrorView};
 use ely_core::forms::{Checkbox, Choice, SearchInput, Select};
 use ely_core::motion::{Spinner, SpinnerStyle};
-use ely_core::primitives::{Icon, IconName};
+use ely_core::primitives::{Icon, IconName, Tooltip};
 use ely_core::shell::{Toolbar, ToolbarGroup, ToolbarSeparator};
 use ely_core::theme::{ActiveTheme, ControlSize, IconSize, Radius, TextSize};
 use git_graph_core::types::{GitCommit, UNCOMMITTED};
 use git_graph_layout::{RefBadge, RowLayout, group_ref_badges};
+use git_graph_ops::BranchSyncStatus;
 use gpui::{
     AnyElement, App, Context, CursorStyle, DragMoveEvent, EmptyView, FontWeight, Hsla,
     InteractiveElement, IntoElement, KeyDownEvent, MouseButton, ParentElement, Pixels,
@@ -22,7 +23,7 @@ use gpui::{
 use crate::app_view::GitGraphApp;
 use crate::graph_canvas::{GraphCellStyle, lane_color, paint_graph_cell};
 use crate::repo_tab::RepoTabState;
-use crate::state::{commit_ref_labels, format_timestamp, short_hash};
+use crate::state::{ColumnWidths, commit_ref_labels, format_timestamp, short_hash};
 
 /// 行高：28px 经典高密度 Git Graph 列表行。
 const ROW_HEIGHT: f32 = 28.0;
@@ -30,6 +31,140 @@ const ROW_HEIGHT: f32 = 28.0;
 const LANE_WIDTH: f32 = 16.0;
 /// 距列表底部多少行时自动触发加载下一页。
 const PREFETCH_TAIL: usize = 24;
+/// 手动拖拽图形列的最小 / 最大宽度限制。
+const GRAPH_MANUAL_MIN_WIDTH: f32 = 72.0;
+const GRAPH_MANUAL_MAX_WIDTH: f32 = 360.0;
+
+/// 统一计算表头与每一行共用的图形列宽度（保证 100% 水平对齐）。
+///
+/// 未手动拖拽过图形列时，随当前 `max_lanes` 在 `[76.0, 260.0]` 区间自动撑开；
+/// 用户手动拖拽表头分隔线后，严格尊重用户设定宽度（并限制在 `[72.0, 360.0]`）。
+pub fn effective_graph_width(tab: &RepoTabState, widths: &ColumnWidths) -> f32 {
+    if widths.graph_manual {
+        return widths
+            .graph
+            .clamp(GRAPH_MANUAL_MIN_WIDTH, GRAPH_MANUAL_MAX_WIDTH);
+    }
+    let lanes = tab.layout.max_lanes.max(1) as f32;
+    (lanes * LANE_WIDTH + 24.0).clamp(76.0, 260.0)
+}
+
+/// 同步按钮点击对应的动作类型。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncButtonAction {
+    Sync,
+    Publish { remote: String, branch: String },
+    None,
+}
+
+/// 顶部工具栏「同步 / 发布分支」按钮与底部状态栏共享的展示规格。
+#[derive(Debug, Clone, PartialEq)]
+pub struct SyncButtonSpec {
+    pub label: String,
+    pub status_bar_label: String,
+    pub tooltip: String,
+    pub icon: IconName,
+    pub highlight: bool,
+    pub disabled: bool,
+    pub action: SyncButtonAction,
+}
+
+/// 将仓库分支同步状态映射为顶部工具栏按钮与状态栏展示文案/状态。
+pub fn sync_button_spec(
+    sync_status: Option<&BranchSyncStatus>,
+    syncing: bool,
+    action_label: Option<&str>,
+) -> SyncButtonSpec {
+    if syncing {
+        let label = action_label.unwrap_or("同步中…").to_string();
+        return SyncButtonSpec {
+            label: label.clone(),
+            status_bar_label: label,
+            tooltip: "正在与远程仓库同步，请稍候…".to_string(),
+            icon: IconName::RefreshCw,
+            highlight: false,
+            disabled: true,
+            action: SyncButtonAction::None,
+        };
+    }
+
+    match sync_status {
+        Some(BranchSyncStatus::Synced {
+            upstream,
+            ahead,
+            behind,
+            ..
+        }) => {
+            if *ahead > 0 || *behind > 0 {
+                SyncButtonSpec {
+                    label: format!("同步 ↓{behind} ↑{ahead}"),
+                    status_bar_label: format!("↻ ↓{behind} ↑{ahead}"),
+                    tooltip: format!(
+                        "与 {upstream} 同步（拉取 {behind} / 推送 {ahead}，遵循本机 git pull 配置）"
+                    ),
+                    icon: IconName::RefreshCw,
+                    highlight: true,
+                    disabled: false,
+                    action: SyncButtonAction::Sync,
+                }
+            } else {
+                SyncButtonSpec {
+                    label: "同步".to_string(),
+                    status_bar_label: "↓0 ↑0".to_string(),
+                    tooltip: format!("与 {upstream} 同步（先 pull 再 push）"),
+                    icon: IconName::RefreshCw,
+                    highlight: false,
+                    disabled: false,
+                    action: SyncButtonAction::Sync,
+                }
+            }
+        }
+        Some(BranchSyncStatus::NoUpstream {
+            branch,
+            default_remote,
+        }) => match default_remote {
+            Some(remote) => SyncButtonSpec {
+                label: "发布分支".to_string(),
+                status_bar_label: "发布分支".to_string(),
+                tooltip: format!("发布分支 {branch} 到 {remote} 并设置上游追踪"),
+                icon: IconName::CloudUpload,
+                highlight: true,
+                disabled: false,
+                action: SyncButtonAction::Publish {
+                    remote: remote.clone(),
+                    branch: branch.clone(),
+                },
+            },
+            None => SyncButtonSpec {
+                label: "发布分支".to_string(),
+                status_bar_label: "发布分支".to_string(),
+                tooltip: "尚未配置远程仓库".to_string(),
+                icon: IconName::CloudOff,
+                highlight: false,
+                disabled: true,
+                action: SyncButtonAction::None,
+            },
+        },
+        Some(BranchSyncStatus::DetachedHead) => SyncButtonSpec {
+            label: "同步".to_string(),
+            status_bar_label: "分离 HEAD".to_string(),
+            tooltip: "当前处于分离 HEAD，无法同步".to_string(),
+            icon: IconName::RefreshCw,
+            highlight: false,
+            disabled: true,
+            action: SyncButtonAction::None,
+        },
+        None => SyncButtonSpec {
+            label: "同步".to_string(),
+            status_bar_label: "检查同步…".to_string(),
+            tooltip: "正在检查远程同步状态…".to_string(),
+            icon: IconName::RefreshCw,
+            highlight: false,
+            disabled: true,
+            action: SyncButtonAction::None,
+        },
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ResizeCol {
@@ -245,20 +380,31 @@ pub fn render_filter_toolbar(
             }
         });
 
-    let fetch_btn = Button::new(
-        "fetch-remote-btn",
-        if tab.fetching { "Fetch 中…" } else { "Fetch" },
-    )
-    .icon(IconName::Download)
-    .variant(ButtonVariant::Secondary)
-    .size(ControlSize::Sm)
-    .disabled(tab.fetching)
-    .on_click({
-        let weak = weak.clone();
-        move |_, _, cx| {
-            weak.update(cx, |this, cx| this.run_fetch_active(cx)).ok();
-        }
-    });
+    let sync_spec = sync_button_spec(
+        tab.sync_status.as_ref(),
+        tab.syncing,
+        tab.sync_action_label.as_deref(),
+    );
+    let sync_btn = Button::new("sync-branch-btn", sync_spec.label)
+        .icon(sync_spec.icon)
+        .variant(if sync_spec.highlight {
+            ButtonVariant::Primary
+        } else {
+            ButtonVariant::Secondary
+        })
+        .size(ControlSize::Sm)
+        .disabled(sync_spec.disabled)
+        .on_click({
+            let weak = weak.clone();
+            move |_, _, cx| {
+                weak.update(cx, |this, cx| this.run_sync_or_publish_active(cx))
+                    .ok();
+            }
+        });
+    let sync_btn_with_tip = div()
+        .id("sync-branch-btn-wrap")
+        .tooltip(Tooltip::text(sync_spec.tooltip))
+        .child(sync_btn);
 
     div()
         .w_full()
@@ -286,7 +432,7 @@ pub fn render_filter_toolbar(
                         .child(toggle_details_btn)
                         .child(refresh_btn)
                         .child(ToolbarSeparator)
-                        .child(fetch_btn),
+                        .child(sync_btn_with_tip),
                 ),
         )
         .into_any_element()
@@ -301,9 +447,10 @@ pub fn render_graph_table(
     let theme = cx.theme();
     let colors = theme.colors.clone();
     let widths = app.persisted.column_widths.clone();
+    let graph_col_w = effective_graph_width(tab, &widths);
     let weak = cx.weak_entity();
 
-    let header = render_table_header(&widths, weak.clone(), cx);
+    let header = render_table_header(graph_col_w, &widths, weak.clone(), cx);
 
     let total_rows = tab.visible_commit_count();
     let show_load_more = tab.more_available && !tab.is_search_active();
@@ -382,9 +529,6 @@ pub fn render_graph_table(
         let rows_layout: Rc<Vec<RowLayout>> = Rc::new(tab.layout.rows.clone());
         let repo_path = tab.path.clone();
         let loading_more = tab.loading_more;
-        let max_lanes = tab.layout.max_lanes.max(1);
-        let auto_graph_min = (max_lanes as f32 * LANE_WIDTH + 22.0).max(72.0);
-        let graph_col_w = widths.graph.max(auto_graph_min.min(widths.graph.max(96.0)));
 
         uniform_list(
             ("git-graph-rows", tab_id),
@@ -450,6 +594,7 @@ pub fn render_graph_table(
                                 row_bg: if is_selected { colors.bg } else { row_bg },
                                 muted_color: colors.fg_subtle,
                                 stash_color: colors.success,
+                                border_color: colors.border.opacity(0.6),
                             },
                         );
 
@@ -614,7 +759,8 @@ fn render_load_more_row(
 }
 
 fn render_table_header(
-    widths: &crate::state::ColumnWidths,
+    graph_col_w: f32,
+    widths: &ColumnWidths,
     weak: gpui::WeakEntity<GitGraphApp>,
     cx: &App,
 ) -> AnyElement {
@@ -660,6 +806,12 @@ fn render_table_header(
             )
     };
 
+    let graph_drag_handle = drag_handle("resize-col-graph", ResizeCol::Graph, graph_col_w)
+        .absolute()
+        .top_0()
+        .bottom_0()
+        .right(px(-3.0));
+
     div()
         .id("graph-table-header")
         .w_full()
@@ -682,7 +834,8 @@ fn render_table_header(
             };
             let delta = f32::from(x - anchor);
             let next_width = match drag.col {
-                ResizeCol::Graph => (drag.start_width + delta).clamp(72.0, 360.0),
+                ResizeCol::Graph => (drag.start_width + delta)
+                    .clamp(GRAPH_MANUAL_MIN_WIDTH, GRAPH_MANUAL_MAX_WIDTH),
                 ResizeCol::Date => (drag.start_width - delta).clamp(96.0, 240.0),
                 ResizeCol::Author => (drag.start_width - delta).clamp(80.0, 240.0),
                 ResizeCol::Commit => (drag.start_width - delta).clamp(64.0, 140.0),
@@ -695,12 +848,16 @@ fn render_table_header(
         })
         .child(
             div()
+                .relative()
                 .flex_none()
-                .w(px(widths.graph))
+                .w(px(graph_col_w))
+                .h_full()
+                .flex()
+                .items_center()
                 .px_2()
-                .child(col_label("图形")),
+                .child(col_label("图形"))
+                .child(graph_drag_handle),
         )
-        .child(drag_handle("resize-col-graph", ResizeCol::Graph, widths.graph))
         .child(
             div()
                 .flex_1()
@@ -994,5 +1151,129 @@ fn render_ref_badge(
             )
             .child(selector.clone())
             .into_any_element(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::process::Command;
+
+    use git_graph_core::api::Engine;
+
+    use super::*;
+
+    fn init_empty_repo() -> (tempfile::TempDir, Engine) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = Command::new("git")
+            .current_dir(dir.path())
+            .args(["init", "-b", "main"])
+            .output()
+            .expect("git init");
+        assert!(out.status.success());
+        let engine = Engine::open(dir.path()).expect("open engine");
+        (dir, engine)
+    }
+
+    #[test]
+    fn effective_graph_width_adapts_and_respects_manual_override() {
+        let (_dir, engine) = init_empty_repo();
+        let mut tab = RepoTabState::new(1, engine);
+        let mut widths = ColumnWidths::default();
+        assert!(!widths.graph_manual);
+
+        // 0 或 1 泳道：clamp 到下限 76.0
+        tab.layout.max_lanes = 0;
+        assert_eq!(effective_graph_width(&tab, &widths), 76.0);
+        tab.layout.max_lanes = 1;
+        assert_eq!(effective_graph_width(&tab, &widths), 76.0);
+
+        // 5 泳道：5 * 16 + 24 = 104.0
+        tab.layout.max_lanes = 5;
+        assert_eq!(effective_graph_width(&tab, &widths), 104.0);
+
+        // 超多泳道（30 泳道）：自适应上限 clamp 在 260.0
+        tab.layout.max_lanes = 30;
+        assert_eq!(effective_graph_width(&tab, &widths), 260.0);
+
+        // 用户手动拖窄至 88.0：尊重手动设置
+        widths.graph_manual = true;
+        widths.graph = 88.0;
+        assert_eq!(effective_graph_width(&tab, &widths), 88.0);
+
+        // 手动宽度的极窄/极宽边界安全 clamp 在 [72.0, 360.0]
+        widths.graph = 20.0;
+        assert_eq!(effective_graph_width(&tab, &widths), 72.0);
+        widths.graph = 600.0;
+        assert_eq!(effective_graph_width(&tab, &widths), 360.0);
+    }
+
+    #[test]
+    fn sync_button_spec_maps_all_branch_sync_states() {
+        // 1. Synced(0, 0) -> 次级柔和样式
+        let clean = BranchSyncStatus::Synced {
+            branch: "main".to_string(),
+            upstream: "origin/main".to_string(),
+            ahead: 0,
+            behind: 0,
+        };
+        let clean_spec = sync_button_spec(Some(&clean), false, None);
+        assert_eq!(clean_spec.label, "同步");
+        assert_eq!(clean_spec.status_bar_label, "↓0 ↑0");
+        assert!(!clean_spec.highlight);
+        assert!(!clean_spec.disabled);
+        assert_eq!(clean_spec.action, SyncButtonAction::Sync);
+
+        // 2. Synced(ahead=2, behind=1) -> 高亮主按钮，清晰显示 ↓1 ↑2
+        let diverged = BranchSyncStatus::Synced {
+            branch: "main".to_string(),
+            upstream: "origin/main".to_string(),
+            ahead: 2,
+            behind: 1,
+        };
+        let div_spec = sync_button_spec(Some(&diverged), false, None);
+        assert_eq!(div_spec.label, "同步 ↓1 ↑2");
+        assert_eq!(div_spec.status_bar_label, "↻ ↓1 ↑2");
+        assert!(div_spec.highlight);
+        assert!(!div_spec.disabled);
+        assert!(div_spec.tooltip.contains("origin/main"));
+        assert_eq!(div_spec.action, SyncButtonAction::Sync);
+
+        // 3. NoUpstream 有默认 remote -> 显示发布分支
+        let no_up = BranchSyncStatus::NoUpstream {
+            branch: "feat/sync".to_string(),
+            default_remote: Some("origin".to_string()),
+        };
+        let pub_spec = sync_button_spec(Some(&no_up), false, None);
+        assert_eq!(pub_spec.label, "发布分支");
+        assert!(!pub_spec.disabled);
+        assert_eq!(
+            pub_spec.action,
+            SyncButtonAction::Publish {
+                remote: "origin".to_string(),
+                branch: "feat/sync".to_string(),
+            }
+        );
+
+        // 4. NoUpstream 无 remote -> 置灰
+        let no_remote = BranchSyncStatus::NoUpstream {
+            branch: "feat/local".to_string(),
+            default_remote: None,
+        };
+        let no_rem_spec = sync_button_spec(Some(&no_remote), false, None);
+        assert!(no_rem_spec.disabled);
+        assert_eq!(no_rem_spec.tooltip, "尚未配置远程仓库");
+        assert_eq!(no_rem_spec.action, SyncButtonAction::None);
+
+        // 5. DetachedHead -> 置灰
+        let detached = sync_button_spec(Some(&BranchSyncStatus::DetachedHead), false, None);
+        assert!(detached.disabled);
+        assert!(detached.tooltip.contains("分离 HEAD"));
+        assert_eq!(detached.action, SyncButtonAction::None);
+
+        // 6. syncing = true -> 禁用并显示进度文案
+        let busy = sync_button_spec(Some(&diverged), true, Some("发布中…"));
+        assert!(busy.disabled);
+        assert_eq!(busy.label, "发布中…");
+        assert_eq!(busy.action, SyncButtonAction::None);
     }
 }

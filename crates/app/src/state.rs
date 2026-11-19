@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use git_graph_core::api::GraphOptions;
 use git_graph_core::types::{CommitOrdering, GitCommit, UNCOMMITTED};
 use git_graph_layout::{
-    CommitNode, GraphLayout, NodeKind, RefKind, RefLabel, RowLayout,
+    CommitNode, GraphLayout, LayoutOptions, RefKind, RefLabel, compute_layout_with_options,
 };
 use gpui::ImageFormat;
 use jiff::Timestamp;
@@ -17,8 +17,10 @@ const MAX_RECENT_REPOS: usize = 12;
 
 /// 5 列宽度持久化配置（像素）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ColumnWidths {
     pub graph: f32,
+    pub graph_manual: bool,
     pub date: f32,
     pub author: f32,
     pub commit: f32,
@@ -28,6 +30,7 @@ impl Default for ColumnWidths {
     fn default() -> Self {
         Self {
             graph: 132.0,
+            graph_manual: false,
             date: 148.0,
             author: 136.0,
             commit: 86.0,
@@ -208,40 +211,20 @@ pub fn matches_author_filter(commit: &GitCommit, author_filter: Option<&str>) ->
     commit.author.to_lowercase() == author.to_lowercase()
 }
 
-/// 为跨页搜索结果计算干净的单节点列表布局（不绘制跨页错乱连线）。
-pub fn compute_search_layout(commits: &[CommitNode], head_hash: Option<&str>) -> GraphLayout {
-    let rows = commits
-        .iter()
-        .map(|node| {
-            let is_head = head_hash.is_some_and(|head| head == node.hash);
-            let is_merge = !node.is_uncommitted && node.parents.len() > 1;
-            let node_kind = if node.is_uncommitted {
-                NodeKind::Uncommitted
-            } else if node.is_stash {
-                NodeKind::Stash
-            } else if is_head {
-                NodeKind::Head
-            } else if is_merge {
-                NodeKind::Merge
-            } else {
-                NodeKind::Normal
-            };
-            RowLayout {
-                lane: 0,
-                color_index: 0,
-                node_kind,
-                is_head,
-                is_merge,
-                active_lanes: 1,
-                segments: Vec::new(),
-            }
-        })
-        .collect();
-
-    GraphLayout {
-        rows,
-        max_lanes: usize::from(!commits.is_empty()),
-    }
+/// 计算提交图谱布局；当 `truncate_missing_parents` 为 `true` 时截断指向可见列表之外的悬空线，
+/// 仅保留当前可见提交之间的真实父子连线。
+pub fn compute_graph_layout(
+    commits: &[CommitNode],
+    head_hash: Option<&str>,
+    truncate_missing_parents: bool,
+) -> GraphLayout {
+    compute_layout_with_options(
+        commits,
+        head_hash,
+        LayoutOptions {
+            truncate_missing_parents,
+        },
+    )
 }
 
 /// 将 `GitCommit` 转换为图谱布局所需的 `CommitNode`。
@@ -462,28 +445,61 @@ mod tests {
     }
 
     #[test]
-    fn search_layout_and_author_filter_behave_cleanly() {
-        let head = make_commit("aaaa1111", "Alice", "Head commit", vec!["main"]);
-        let mut merge = make_commit("bbbb2222", "Bob", "Merge branch", vec![]);
-        merge.parents = vec!["p1".to_string(), "p2".to_string()];
+    fn filtered_layout_truncates_missing_parents_and_keeps_visible_links() {
+        use git_graph_layout::{NodeKind, SegmentKind};
+
+        // 构造两条存在父子关系的可见提交（child -> parent），其中 parent 另有一个列表外父提交 missing_p，
+        // 以及一条指向列表外提交 missing_other 的 merge 父提交。
+        let mut child = make_commit("aaaa1111", "Alice", "Head commit", vec!["main"]);
+        child.parents = vec!["bbbb2222".to_string(), "missing_other".to_string()];
+        let mut parent = make_commit("bbbb2222", "Bob", "Parent commit", vec![]);
+        parent.parents = vec!["missing_p1".to_string(), "missing_p2".to_string()];
         let uncommitted = make_commit(UNCOMMITTED, "*", "Uncommitted", vec![]);
 
         let nodes = vec![
             commit_to_node(&uncommitted),
-            commit_to_node(&head),
-            commit_to_node(&merge),
+            commit_to_node(&child),
+            commit_to_node(&parent),
         ];
-        let layout = compute_search_layout(&nodes, Some("aaaa1111"));
-        assert_eq!(layout.max_lanes, 1);
+        let layout = compute_graph_layout(&nodes, Some("aaaa1111"), true);
         assert_eq!(layout.rows.len(), 3);
-        assert!(layout.rows.iter().all(|r| r.segments.is_empty() && r.lane == 0));
         assert_eq!(layout.rows[0].node_kind, NodeKind::Uncommitted);
         assert_eq!(layout.rows[1].node_kind, NodeKind::Head);
         assert_eq!(layout.rows[2].node_kind, NodeKind::Merge);
 
-        assert!(matches_author_filter(&head, None));
-        assert!(matches_author_filter(&head, Some("alice")));
-        assert!(!matches_author_filter(&head, Some("Bob")));
+        // child 仅保留连向可见 parent (bbbb2222) 的向下连线，指向 missing_other 的悬空线已被截断
+        let child_out: Vec<_> = layout.rows[1]
+            .segments
+            .iter()
+            .filter(|s| s.kind == SegmentKind::NodeToBottom)
+            .collect();
+        assert_eq!(child_out.len(), 1);
+
+        // parent 保留来自 child 的 TopToNode 连线，且其指向 missing_p 的悬空线已被截断
+        assert!(
+            layout.rows[2]
+                .segments
+                .iter()
+                .any(|s| s.kind == SegmentKind::TopToNode)
+        );
+        assert!(
+            !layout.rows[2]
+                .segments
+                .iter()
+                .any(|s| s.kind == SegmentKind::NodeToBottom)
+        );
+
+        assert!(matches_author_filter(&child, None));
+        assert!(matches_author_filter(&child, Some("alice")));
+        assert!(!matches_author_filter(&child, Some("Bob")));
         assert!(!matches_author_filter(&uncommitted, Some("Alice")));
+    }
+
+    #[test]
+    fn column_widths_legacy_json_defaults_graph_manual_to_false() {
+        let legacy = r#"{"graph":150.0,"date":140.0,"author":130.0,"commit":80.0}"#;
+        let parsed: ColumnWidths = serde_json::from_str(legacy).unwrap();
+        assert_eq!(parsed.graph, 150.0);
+        assert!(!parsed.graph_manual);
     }
 }

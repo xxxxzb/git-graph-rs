@@ -1,0 +1,169 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <!-- macOS App Icon 外部柔和投影 -->
+    <filter id="icon-shadow" x="-15%" y="-15%" width="130%" height="135%">
+      <feDropShadow dx="0" dy="18" stdDeviation="24" flood-color="#040711" flood-opacity="0.34"/>
+      <feDropShadow dx="0" dy="4" stdDeviation="6" flood-color="#040711" flood-opacity="0.22"/>
+    </filter>
+
+    <!-- 节点柔和彩色发光 -->
+    <filter id="glow-blue" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="16" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="glow-teal" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="14" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="glow-amber" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="16" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <!-- 底板主渐变：温润深墨石板蓝 -->
+    <linearGradient id="bg-grad" gradientUnits="userSpaceOnUse" x1="180" y1="120" x2="860" y2="900">
+      <stop offset="0%" stop-color="#28334B"/>
+      <stop offset="50%" stop-color="#192134"/>
+      <stop offset="100%" stop-color="#0F1422"/>
+    </linearGradient>
+
+    <!-- 顶部柔和漫反射光泽（无硬边） -->
+    <linearGradient id="top-sheen" gradientUnits="userSpaceOnUse" x1="512" y1="100" x2="512" y2="480">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.11"/>
+      <stop offset="45%" stop-color="#FFFFFF" stop-opacity="0.025"/>
+      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+
+    <!-- 左上冷光氛围 -->
+    <radialGradient id="ambient-top-left" gradientUnits="userSpaceOnUse" cx="310" cy="260" r="460">
+      <stop offset="0%" stop-color="#60A5FA" stop-opacity="0.20"/>
+      <stop offset="55%" stop-color="#3B82F6" stop-opacity="0.05"/>
+      <stop offset="100%" stop-color="#192134" stop-opacity="0"/>
+    </radialGradient>
+
+    <!-- 右中暖琥珀微光（致敬 Rust 质感） -->
+    <radialGradient id="ambient-right" gradientUnits="userSpaceOnUse" cx="710" cy="430" r="380">
+      <stop offset="0%" stop-color="#F97316" stop-opacity="0.18"/>
+      <stop offset="55%" stop-color="#F59E0B" stop-opacity="0.04"/>
+      <stop offset="100%" stop-color="#0F1422" stop-opacity="0"/>
+    </radialGradient>
+
+    <!-- 顶部玻璃内描边高光 -->
+    <linearGradient id="rim-highlight" gradientUnits="userSpaceOnUse" x1="512" y1="100" x2="512" y2="924">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.30"/>
+      <stop offset="30%" stop-color="#FFFFFF" stop-opacity="0.08"/>
+      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0.03"/>
+    </linearGradient>
+
+    <!-- 3 条泳道渐变色（userSpaceOnUse 保证垂直线/曲线均可完美渲染） -->
+    <linearGradient id="lane-blue" gradientUnits="userSpaceOnUse" x1="344" y1="286" x2="344" y2="740">
+      <stop offset="0%" stop-color="#7DD3FC"/>
+      <stop offset="48%" stop-color="#3B82F6"/>
+      <stop offset="100%" stop-color="#2563EB"/>
+    </linearGradient>
+
+    <linearGradient id="lane-teal" gradientUnits="userSpaceOnUse" x1="344" y1="290" x2="520" y2="736">
+      <stop offset="0%" stop-color="#5EEAD4"/>
+      <stop offset="52%" stop-color="#14B8A6"/>
+      <stop offset="100%" stop-color="#0D9488"/>
+    </linearGradient>
+
+    <linearGradient id="lane-amber" gradientUnits="userSpaceOnUse" x1="518" y1="540" x2="692" y2="386">
+      <stop offset="0%" stop-color="#EA580C"/>
+      <stop offset="52%" stop-color="#F97316"/>
+      <stop offset="100%" stop-color="#FCD34D"/>
+    </linearGradient>
+
+    <!-- 圆角裁剪区域 -->
+    <clipPath id="squircle-clip">
+      <rect x="100" y="100" width="824" height="824" rx="186" ry="186"/>
+    </clipPath>
+  </defs>
+
+  <!-- macOS 圆角方底 -->
+  <g filter="url(#icon-shadow)">
+    <rect x="100" y="100" width="824" height="824" rx="186" ry="186" fill="url(#bg-grad)"/>
+  </g>
+
+  <!-- 内部光效与微妙泳道导轨 -->
+  <g clip-path="url(#squircle-clip)">
+    <rect x="100" y="100" width="824" height="824" fill="url(#ambient-top-left)"/>
+    <rect x="100" y="100" width="824" height="824" fill="url(#ambient-right)"/>
+    <rect x="100" y="100" width="824" height="380" fill="url(#top-sheen)"/>
+
+    <!-- 极淡的垂直泳道参考底线 -->
+    <g stroke="#94A3B8" stroke-opacity="0.06" stroke-width="2">
+      <line x1="344" y1="100" x2="344" y2="924"/>
+      <line x1="518" y1="100" x2="518" y2="924"/>
+      <line x1="692" y1="100" x2="692" y2="924"/>
+    </g>
+  </g>
+
+  <!-- 精细内高光边框 -->
+  <rect x="102" y="102" width="820" height="820" rx="184" ry="184"
+        fill="none" stroke="url(#rim-highlight)" stroke-width="3"/>
+
+  <!-- ================= 核心 Git Graph 泳道图形 ================= -->
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <!-- 1. 右侧暖琥珀分支（从中列节点中心自然向上右平滑分叉至尖端） -->
+    <path d="M 518 524 C 518 454, 692 478, 692 396"
+          stroke="url(#lane-amber)" stroke-width="34"/>
+
+    <!-- 2. 中间翠青分支（从主干底部分叉 → 中列推进 → 合流回主干顶部 HEAD） -->
+    <path d="M 344 736
+             C 344 648, 518 664, 518 578
+             L 518 456
+             C 518 370, 344 384, 344 290"
+          stroke="url(#lane-teal)" stroke-width="34"/>
+
+    <!-- 3. 左侧钴蓝主干（贯通底部至顶部 HEAD） -->
+    <line x1="344" y1="290" x2="344" y2="736"
+          stroke="url(#lane-blue)" stroke-width="36"/>
+  </g>
+
+  <!-- ================= 提交节点（带深底分隔环与柔光） ================= -->
+
+  <!-- 主干底部起始节点 -->
+  <g>
+    <circle cx="344" cy="736" r="44" fill="#131928"/>
+    <circle cx="344" cy="736" r="28" fill="#3B82F6"/>
+    <circle cx="337" cy="728" r="8" fill="#BAE6FD" fill-opacity="0.65"/>
+  </g>
+
+  <!-- 主干中部普通提交节点 -->
+  <g>
+    <circle cx="344" cy="518" r="42" fill="#161D2E"/>
+    <circle cx="344" cy="518" r="26" fill="#60A5FA"/>
+    <circle cx="338" cy="511" r="7" fill="#E0F2FE" fill-opacity="0.72"/>
+  </g>
+
+  <!-- 中列翠青提交节点（完美包覆青/橙分支交点） -->
+  <g filter="url(#glow-teal)">
+    <circle cx="518" cy="524" r="46" fill="#161D2E"/>
+    <circle cx="518" cy="524" r="30" fill="#2DD4BF"/>
+    <circle cx="510" cy="515" r="9" fill="#CCFBF1" fill-opacity="0.78"/>
+  </g>
+
+  <!-- 右列暖琥珀活跃尖端节点（Rust 暖色点睛） -->
+  <g filter="url(#glow-amber)">
+    <circle cx="692" cy="396" r="48" fill="#171E30"/>
+    <circle cx="692" cy="396" r="32" fill="url(#lane-amber)"/>
+    <circle cx="683" cy="386" r="9" fill="#FEF3C7" fill-opacity="0.85"/>
+  </g>
+
+  <!-- 主干顶部 HEAD / Merge 标志性空心亮环节点 -->
+  <g filter="url(#glow-blue)">
+    <circle cx="344" cy="290" r="56" fill="#192135"/>
+    <circle cx="344" cy="290" r="41" fill="none" stroke="#7DD3FC" stroke-width="18"/>
+    <circle cx="344" cy="290" r="18" fill="#F8FAFC"/>
+  </g>
+</svg>

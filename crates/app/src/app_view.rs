@@ -17,7 +17,7 @@ use ely_core::shell::{StatusBar, StatusBarItem, drag_region};
 use ely_core::theme::{ActiveTheme, ControlSize, IconSize, Mode, TextSize, Theme};
 use ely_git::DiffLayout;
 use git_graph_core::api::Engine;
-use git_graph_core::types::{GitCommit, UNCOMMITTED};
+use git_graph_core::types::UNCOMMITTED;
 use git_graph_ops::{
     BranchSyncStatus, GitCli, PushForceMode, PushOptions, RepoWatcher, ResetMode, WatchEvent,
     check_checkout_safety, check_reset_safety,
@@ -29,7 +29,7 @@ use gpui::{
 };
 
 use crate::modals::{
-    ActiveModal, ContextMenuState, PendingWriteOp, build_commit_context_menu,
+    ActiveModal, ContextMenuState, ContextMenuTarget, PendingWriteOp, build_context_menu,
     compute_push_defaults, render_active_modal,
 };
 use crate::repo_tab::{
@@ -898,47 +898,94 @@ impl GitGraphApp {
 
     /* ---------- 右键上下文菜单 & 模态框打开 ---------- */
 
-    pub fn open_commit_context_menu(
+    pub fn open_context_menu(
         &mut self,
-        repo_path: PathBuf,
-        commit: GitCommit,
-        focused_branch: Option<String>,
-        focused_tag: Option<String>,
+        target: ContextMenuTarget,
         position: Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
-        let current_branch = self
-            .tabs
-            .iter()
-            .find(|t| t.path == repo_path)
-            .or_else(|| self.active_tab())
-            .and_then(|t| t.info.as_ref().and_then(|i| i.head.clone()));
         self.next_ctx_request_id += 1;
         self.context_menu = Some(ContextMenuState {
             request_id: self.next_ctx_request_id,
             position,
-            repo_path,
-            commit,
-            focused_branch,
-            focused_tag,
-            current_branch,
+            target,
         });
         cx.notify();
+    }
+
+    pub fn copy_text_with_toast(
+        &self,
+        text: String,
+        toast_title: String,
+        cx: &mut Context<Self>,
+    ) {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.clone()));
+        let first_line = text.lines().next().unwrap_or(&text).trim();
+        let preview = if first_line.chars().count() > 64 {
+            let truncated: String = first_line.chars().take(64).collect();
+            format!("{truncated}…")
+        } else {
+            first_line.to_string()
+        };
+        let body = (!preview.is_empty()).then_some(preview);
+        self.push_toast(toast_title, Severity::Success, body, cx);
+    }
+
+    pub fn refresh_repo_workspace(&mut self, repo_path: PathBuf, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tab_by_path_mut(&repo_path) {
+            let id = tab.id;
+            self.load_tab_graph(id, false, cx);
+        } else {
+            self.refresh_active_tab(false, cx);
+        }
     }
 
     pub fn open_create_branch_modal(
         &mut self,
         repo_path: PathBuf,
         start_point: String,
+        initial_name: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let input = cx.new(|cx| TextInput::new(window, cx).placeholder("例如 feature/my-branch"));
+        if let Some(default_name) = initial_name {
+            input.update(cx, |input, cx| {
+                input.set_text(default_name, cx);
+                let len = input.text().len();
+                if len > 0 {
+                    input.select(0..len, cx);
+                }
+            });
+        }
         self.modal = Some(ActiveModal::CreateBranch {
             repo_path,
             start_point,
             input,
             checkout: true,
+        });
+        cx.notify();
+    }
+
+    pub fn open_rename_branch_modal(
+        &mut self,
+        repo_path: PathBuf,
+        old_name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input = cx.new(|cx| TextInput::new(window, cx).placeholder("输入新分支名称"));
+        input.update(cx, |input, cx| {
+            input.set_text(old_name.clone(), cx);
+            let len = input.text().len();
+            if len > 0 {
+                input.select(0..len, cx);
+            }
+        });
+        self.modal = Some(ActiveModal::RenameBranch {
+            repo_path,
+            old_name,
+            input,
         });
         cx.notify();
     }
@@ -1430,6 +1477,43 @@ impl GitGraphApp {
                     &repo_for_refresh,
                     format!("已创建分支 {label}"),
                     "创建分支失败",
+                    res,
+                    cx,
+                );
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub fn run_rename_branch(
+        &mut self,
+        repo_path: PathBuf,
+        old_name: String,
+        new_name: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(cli) = self.ensure_cli(cx) else {
+            return;
+        };
+        let repo_for_refresh = repo_path.clone();
+        let old_label = old_name.clone();
+        let new_label = new_name.clone();
+        cx.spawn(async move |weak, cx| {
+            let res = cx
+                .background_spawn(async move { cli.rename_branch(&repo_path, &old_name, &new_name) })
+                .await;
+            weak.update(cx, |this, cx| {
+                if res.is_ok()
+                    && let Some(tab) = this.tab_by_path_mut(&repo_for_refresh)
+                    && tab.filter.branch.as_deref() == Some(old_label.as_str())
+                {
+                    tab.filter.branch = Some(new_label.clone());
+                }
+                this.finish_write_op(
+                    &repo_for_refresh,
+                    format!("已将分支 {old_label} 重命名为 {new_label}"),
+                    "重命名分支失败",
                     res,
                     cx,
                 );
@@ -1991,7 +2075,7 @@ impl GitGraphApp {
         };
 
         let menu = match &self.context_menu {
-            Some(ctx_menu) => build_commit_context_menu(ctx_menu, cx.weak_entity()),
+            Some(ctx_menu) => build_context_menu(ctx_menu, cx.weak_entity()),
             None => Menu::new(),
         };
         let request = self

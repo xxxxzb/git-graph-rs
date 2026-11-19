@@ -8,7 +8,7 @@ use ely_core::data_display::{Badge, Tone};
 use ely_core::feedback::{EmptyState, ErrorView};
 use ely_core::forms::{Checkbox, Choice, SearchInput, Select};
 use ely_core::motion::{Spinner, SpinnerStyle};
-use ely_core::primitives::{Icon, IconName, Tooltip};
+use ely_core::primitives::{Icon, IconName};
 use ely_core::shell::{Toolbar, ToolbarGroup, ToolbarSeparator};
 use ely_core::theme::{ActiveTheme, ControlSize, IconSize, Radius, TextSize};
 use git_graph_core::types::{GitCommit, UNCOMMITTED};
@@ -22,6 +22,7 @@ use gpui::{
 
 use crate::app_view::GitGraphApp;
 use crate::graph_canvas::{GraphCellStyle, lane_color, paint_graph_cell};
+use crate::modals::{ContextMenuTarget, parse_stash_index};
 use crate::repo_tab::RepoTabState;
 use crate::state::{ColumnWidths, commit_ref_labels, format_timestamp, short_hash};
 
@@ -57,19 +58,17 @@ pub enum SyncButtonAction {
     None,
 }
 
-/// 顶部工具栏「同步 / 发布分支」按钮与底部状态栏共享的展示规格。
+/// 左下角状态栏「同步 / 发布分支」状态项的展示规格。
 #[derive(Debug, Clone, PartialEq)]
 pub struct SyncButtonSpec {
-    pub label: String,
     pub status_bar_label: String,
     pub tooltip: String,
     pub icon: IconName,
-    pub highlight: bool,
     pub disabled: bool,
     pub action: SyncButtonAction,
 }
 
-/// 将仓库分支同步状态映射为顶部工具栏按钮与状态栏展示文案/状态。
+/// 将仓库分支同步状态映射为底部状态栏展示文案与点击动作。
 pub fn sync_button_spec(
     sync_status: Option<&BranchSyncStatus>,
     syncing: bool,
@@ -78,11 +77,9 @@ pub fn sync_button_spec(
     if syncing {
         let label = action_label.unwrap_or("同步中…").to_string();
         return SyncButtonSpec {
-            label: label.clone(),
             status_bar_label: label,
             tooltip: "正在与远程仓库同步，请稍候…".to_string(),
             icon: IconName::RefreshCw,
-            highlight: false,
             disabled: true,
             action: SyncButtonAction::None,
         };
@@ -97,23 +94,19 @@ pub fn sync_button_spec(
         }) => {
             if *ahead > 0 || *behind > 0 {
                 SyncButtonSpec {
-                    label: format!("同步 ↓{behind} ↑{ahead}"),
                     status_bar_label: format!("↻ ↓{behind} ↑{ahead}"),
                     tooltip: format!(
                         "与 {upstream} 同步（拉取 {behind} / 推送 {ahead}，遵循本机 git pull 配置）"
                     ),
                     icon: IconName::RefreshCw,
-                    highlight: true,
                     disabled: false,
                     action: SyncButtonAction::Sync,
                 }
             } else {
                 SyncButtonSpec {
-                    label: "同步".to_string(),
                     status_bar_label: "↓0 ↑0".to_string(),
                     tooltip: format!("与 {upstream} 同步（先 pull 再 push）"),
                     icon: IconName::RefreshCw,
-                    highlight: false,
                     disabled: false,
                     action: SyncButtonAction::Sync,
                 }
@@ -124,11 +117,9 @@ pub fn sync_button_spec(
             default_remote,
         }) => match default_remote {
             Some(remote) => SyncButtonSpec {
-                label: "发布分支".to_string(),
                 status_bar_label: "发布分支".to_string(),
                 tooltip: format!("发布分支 {branch} 到 {remote} 并设置上游追踪"),
                 icon: IconName::CloudUpload,
-                highlight: true,
                 disabled: false,
                 action: SyncButtonAction::Publish {
                     remote: remote.clone(),
@@ -136,30 +127,24 @@ pub fn sync_button_spec(
                 },
             },
             None => SyncButtonSpec {
-                label: "发布分支".to_string(),
                 status_bar_label: "发布分支".to_string(),
                 tooltip: "尚未配置远程仓库".to_string(),
                 icon: IconName::CloudOff,
-                highlight: false,
                 disabled: true,
                 action: SyncButtonAction::None,
             },
         },
         Some(BranchSyncStatus::DetachedHead) => SyncButtonSpec {
-            label: "同步".to_string(),
             status_bar_label: "分离 HEAD".to_string(),
             tooltip: "当前处于分离 HEAD，无法同步".to_string(),
             icon: IconName::RefreshCw,
-            highlight: false,
             disabled: true,
             action: SyncButtonAction::None,
         },
         None => SyncButtonSpec {
-            label: "同步".to_string(),
             status_bar_label: "检查同步…".to_string(),
             tooltip: "正在检查远程同步状态…".to_string(),
             icon: IconName::RefreshCw,
-            highlight: false,
             disabled: true,
             action: SyncButtonAction::None,
         },
@@ -380,32 +365,6 @@ pub fn render_filter_toolbar(
             }
         });
 
-    let sync_spec = sync_button_spec(
-        tab.sync_status.as_ref(),
-        tab.syncing,
-        tab.sync_action_label.as_deref(),
-    );
-    let sync_btn = Button::new("sync-branch-btn", sync_spec.label)
-        .icon(sync_spec.icon)
-        .variant(if sync_spec.highlight {
-            ButtonVariant::Primary
-        } else {
-            ButtonVariant::Secondary
-        })
-        .size(ControlSize::Sm)
-        .disabled(sync_spec.disabled)
-        .on_click({
-            let weak = weak.clone();
-            move |_, _, cx| {
-                weak.update(cx, |this, cx| this.run_sync_or_publish_active(cx))
-                    .ok();
-            }
-        });
-    let sync_btn_with_tip = div()
-        .id("sync-branch-btn-wrap")
-        .tooltip(Tooltip::text(sync_spec.tooltip))
-        .child(sync_btn);
-
     div()
         .w_full()
         .bg(colors.surface)
@@ -430,12 +389,33 @@ pub fn render_filter_toolbar(
                     ToolbarGroup::new()
                         .child(jump_head_btn)
                         .child(toggle_details_btn)
-                        .child(refresh_btn)
-                        .child(ToolbarSeparator)
-                        .child(sync_btn_with_tip),
+                        .child(refresh_btn),
                 ),
         )
         .into_any_element()
+}
+
+/// 根据提交行类型构造外层行右键对应的上下文目标。
+pub fn commit_row_context_target(
+    repo_path: std::path::PathBuf,
+    commit: &GitCommit,
+) -> ContextMenuTarget {
+    if commit.hash == UNCOMMITTED {
+        ContextMenuTarget::Uncommitted { repo_path }
+    } else if let Some(stash) = &commit.stash {
+        let index = parse_stash_index(&stash.selector).unwrap_or(0);
+        ContextMenuTarget::Stash {
+            repo_path,
+            selector: stash.selector.clone(),
+            index,
+            hash: commit.hash.clone(),
+        }
+    } else {
+        ContextMenuTarget::Commit {
+            repo_path,
+            commit: commit.clone(),
+        }
+    }
 }
 
 /// 渲染上半区 5 列 Git Graph 宽表。
@@ -654,16 +634,13 @@ pub fn render_graph_table(
                                     .ok();
                             })
                             .on_mouse_down(MouseButton::Right, move |event, _, cx| {
+                                let target = commit_row_context_target(
+                                    repo_for_ctx.clone(),
+                                    &commit_for_ctx,
+                                );
                                 weak_ctx
                                     .update(cx, |this, cx| {
-                                        this.open_commit_context_menu(
-                                            repo_for_ctx.clone(),
-                                            commit_for_ctx.clone(),
-                                            None,
-                                            None,
-                                            event.position,
-                                            cx,
-                                        );
+                                        this.open_context_menu(target, event.position, cx);
                                     })
                                     .ok();
                             })
@@ -991,8 +968,8 @@ fn render_ref_badge(
             };
             let fg = if *is_head { colors.fg } else { colors.info };
             let branch_name = name.clone();
+            let branch_is_head = *is_head;
             let repo = repo_path.to_path_buf();
-            let commit_clone = commit.clone();
             let weak_ctx = weak.clone();
 
             div()
@@ -1017,11 +994,12 @@ fn render_ref_badge(
                     cx.stop_propagation();
                     weak_ctx
                         .update(cx, |this, cx| {
-                            this.open_commit_context_menu(
-                                repo.clone(),
-                                commit_clone.clone(),
-                                Some(branch_name.clone()),
-                                None,
+                            this.open_context_menu(
+                                ContextMenuTarget::LocalBranch {
+                                    repo_path: repo.clone(),
+                                    branch: branch_name.clone(),
+                                    is_head: branch_is_head,
+                                },
                                 event.position,
                                 cx,
                             );
@@ -1064,6 +1042,12 @@ fn render_ref_badge(
             } else {
                 format!("{remote}/{name}")
             };
+            let repo = repo_path.to_path_buf();
+            let remote_name = remote.clone();
+            let branch_name = name.clone();
+            let full_name = label.clone();
+            let remote_head = *is_remote_head;
+            let weak_ctx = weak.clone();
             div()
                 .id(("badge-remote", row_ix * 64 + badge_ix))
                 .flex_none()
@@ -1083,13 +1067,30 @@ fn render_ref_badge(
                     FontWeight::NORMAL
                 })
                 .text_color(colors.fg_muted)
+                .on_mouse_down(MouseButton::Right, move |event, _, cx| {
+                    cx.stop_propagation();
+                    weak_ctx
+                        .update(cx, |this, cx| {
+                            this.open_context_menu(
+                                ContextMenuTarget::RemoteBranch {
+                                    repo_path: repo.clone(),
+                                    remote: remote_name.clone(),
+                                    branch_name: branch_name.clone(),
+                                    full_name: full_name.clone(),
+                                    is_remote_head: remote_head,
+                                },
+                                event.position,
+                                cx,
+                            );
+                        })
+                        .ok();
+                })
                 .child(label)
                 .into_any_element()
         }
         RefBadge::Tag { name, annotated } => {
             let tag_name = name.clone();
             let repo = repo_path.to_path_buf();
-            let commit_clone = commit.clone();
             let weak_ctx = weak.clone();
             div()
                 .id(("badge-tag", row_ix * 64 + badge_ix))
@@ -1114,11 +1115,11 @@ fn render_ref_badge(
                     cx.stop_propagation();
                     weak_ctx
                         .update(cx, |this, cx| {
-                            this.open_commit_context_menu(
-                                repo.clone(),
-                                commit_clone.clone(),
-                                None,
-                                Some(tag_name.clone()),
+                            this.open_context_menu(
+                                ContextMenuTarget::Tag {
+                                    repo_path: repo.clone(),
+                                    name: tag_name.clone(),
+                                },
                                 event.position,
                                 cx,
                             );
@@ -1129,28 +1130,52 @@ fn render_ref_badge(
                 .child(name.clone())
                 .into_any_element()
         }
-        RefBadge::Stash { selector } => div()
-            .id(("badge-stash", row_ix * 64 + badge_ix))
-            .flex_none()
-            .flex()
-            .items_center()
-            .gap_1()
-            .h(px(19.0))
-            .px_1p5()
-            .rounded(radius)
-            .border_1()
-            .border_color(colors.success.opacity(0.5))
-            .bg(colors.success_subtle)
-            .text_size(theme.text_size(TextSize::Xs))
-            .font_weight(FontWeight::MEDIUM)
-            .text_color(colors.success)
-            .child(
-                Icon::new(IconName::Archive)
-                    .size(IconSize::Xs)
-                    .color(colors.success),
-            )
-            .child(selector.clone())
-            .into_any_element(),
+        RefBadge::Stash { selector } => {
+            let repo = repo_path.to_path_buf();
+            let stash_selector = selector.clone();
+            let stash_index = parse_stash_index(selector).unwrap_or(0);
+            let stash_hash = commit.hash.clone();
+            let weak_ctx = weak.clone();
+            div()
+                .id(("badge-stash", row_ix * 64 + badge_ix))
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap_1()
+                .h(px(19.0))
+                .px_1p5()
+                .rounded(radius)
+                .border_1()
+                .border_color(colors.success.opacity(0.5))
+                .bg(colors.success_subtle)
+                .text_size(theme.text_size(TextSize::Xs))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(colors.success)
+                .on_mouse_down(MouseButton::Right, move |event, _, cx| {
+                    cx.stop_propagation();
+                    weak_ctx
+                        .update(cx, |this, cx| {
+                            this.open_context_menu(
+                                ContextMenuTarget::Stash {
+                                    repo_path: repo.clone(),
+                                    selector: stash_selector.clone(),
+                                    index: stash_index,
+                                    hash: stash_hash.clone(),
+                                },
+                                event.position,
+                                cx,
+                            );
+                        })
+                        .ok();
+                })
+                .child(
+                    Icon::new(IconName::Archive)
+                        .size(IconSize::Xs)
+                        .color(colors.success),
+                )
+                .child(selector.clone())
+                .into_any_element()
+        }
     }
 }
 
@@ -1209,7 +1234,7 @@ mod tests {
 
     #[test]
     fn sync_button_spec_maps_all_branch_sync_states() {
-        // 1. Synced(0, 0) -> 次级柔和样式
+        // 1. Synced(0, 0) -> 状态栏显示 ↓0 ↑0
         let clean = BranchSyncStatus::Synced {
             branch: "main".to_string(),
             upstream: "origin/main".to_string(),
@@ -1217,13 +1242,11 @@ mod tests {
             behind: 0,
         };
         let clean_spec = sync_button_spec(Some(&clean), false, None);
-        assert_eq!(clean_spec.label, "同步");
         assert_eq!(clean_spec.status_bar_label, "↓0 ↑0");
-        assert!(!clean_spec.highlight);
         assert!(!clean_spec.disabled);
         assert_eq!(clean_spec.action, SyncButtonAction::Sync);
 
-        // 2. Synced(ahead=2, behind=1) -> 高亮主按钮，清晰显示 ↓1 ↑2
+        // 2. Synced(ahead=2, behind=1) -> 状态栏清晰显示 ↻ ↓1 ↑2
         let diverged = BranchSyncStatus::Synced {
             branch: "main".to_string(),
             upstream: "origin/main".to_string(),
@@ -1231,9 +1254,7 @@ mod tests {
             behind: 1,
         };
         let div_spec = sync_button_spec(Some(&diverged), false, None);
-        assert_eq!(div_spec.label, "同步 ↓1 ↑2");
         assert_eq!(div_spec.status_bar_label, "↻ ↓1 ↑2");
-        assert!(div_spec.highlight);
         assert!(!div_spec.disabled);
         assert!(div_spec.tooltip.contains("origin/main"));
         assert_eq!(div_spec.action, SyncButtonAction::Sync);
@@ -1244,7 +1265,7 @@ mod tests {
             default_remote: Some("origin".to_string()),
         };
         let pub_spec = sync_button_spec(Some(&no_up), false, None);
-        assert_eq!(pub_spec.label, "发布分支");
+        assert_eq!(pub_spec.status_bar_label, "发布分支");
         assert!(!pub_spec.disabled);
         assert_eq!(
             pub_spec.action,
@@ -1273,7 +1294,57 @@ mod tests {
         // 6. syncing = true -> 禁用并显示进度文案
         let busy = sync_button_spec(Some(&diverged), true, Some("发布中…"));
         assert!(busy.disabled);
-        assert_eq!(busy.label, "发布中…");
+        assert_eq!(busy.status_bar_label, "发布中…");
         assert_eq!(busy.action, SyncButtonAction::None);
+    }
+
+    #[test]
+    fn commit_row_context_target_dispatches_uncommitted_stash_and_commit() {
+        use git_graph_core::types::GitCommitStash;
+
+        let repo = std::path::PathBuf::from("/tmp/repo");
+        let base_commit = GitCommit {
+            hash: "a52c6961234567890abcdef".to_string(),
+            parents: vec![],
+            author: "Alice".to_string(),
+            email: "alice@example.com".to_string(),
+            date: 1_700_000_000,
+            message: "init".to_string(),
+            heads: vec!["main".to_string()],
+            tags: vec![],
+            remotes: vec![],
+            stash: None,
+        };
+
+        let uncommitted = GitCommit {
+            hash: UNCOMMITTED.to_string(),
+            ..base_commit.clone()
+        };
+        assert!(matches!(
+            commit_row_context_target(repo.clone(), &uncommitted),
+            ContextMenuTarget::Uncommitted { .. }
+        ));
+
+        let stash_commit = GitCommit {
+            stash: Some(GitCommitStash {
+                selector: "stash@{1}".to_string(),
+                base_hash: "1111111".to_string(),
+                untracked_files_hash: None,
+            }),
+            ..base_commit.clone()
+        };
+        assert!(matches!(
+            commit_row_context_target(repo.clone(), &stash_commit),
+            ContextMenuTarget::Stash {
+                selector,
+                index: 1,
+                ..
+            } if selector == "stash@{1}"
+        ));
+
+        assert!(matches!(
+            commit_row_context_target(repo, &base_commit),
+            ContextMenuTarget::Commit { commit, .. } if commit.hash == base_commit.hash
+        ));
     }
 }

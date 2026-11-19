@@ -8,4 +8,4 @@ pub mod write;
 pub use cli::{CommandOutput, GitCli, OpsError, Result};
 pub use safety::{SafetyRisk, SafetyWarning, check_checkout_safety, check_reset_safety};
 pub use watch::{RepoWatcher, WatchEvent};
-pub use write::ResetMode;
+pub use write::{BranchSyncStatus, PushForceMode, PushOptions, ResetMode, SyncOutcome};

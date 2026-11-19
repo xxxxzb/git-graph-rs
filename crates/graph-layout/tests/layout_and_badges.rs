@@ -2,8 +2,8 @@ use std::collections::BTreeSet;
 use std::time::Instant;
 
 use git_graph_layout::{
-    CommitNode, GraphLayout, NodeKind, RefBadge, RefKind, RefLabel, SegmentKind, compute_layout,
-    group_ref_badges,
+    CommitNode, GraphLayout, LayoutOptions, NodeKind, RefBadge, RefKind, RefLabel, SegmentKind,
+    compute_layout, compute_layout_with_options, group_ref_badges,
 };
 
 fn commit(hash: &str, parents: &[&str]) -> CommitNode {
@@ -525,4 +525,240 @@ fn stress_test_10000_commits_with_branches_and_merges() {
         elapsed.as_secs_f64() < 1.0,
         "10k layout took too long: {elapsed:?}"
     );
+}
+
+#[test]
+fn truncate_missing_parents_prevents_dangling_waterfall_and_preserves_visible_edges() {
+    // Discontinuous filtered subset: isolated commits mixed with adjacent and gapped parent-child pairs.
+    let commits = vec![
+        commit("iso1", &["missing_1"]),
+        commit("iso2", &["missing_2"]),
+        commit("g_child", &["g_parent"]),
+        commit("iso3", &["missing_3"]),
+        commit("adj_child", &["adj_parent"]),
+        commit("adj_parent", &["missing_4"]),
+        commit("g_parent", &["missing_5"]),
+        commit("iso4", &["missing_6"]),
+    ];
+
+    let legacy_layout = compute_layout(&commits, None);
+    assert_layout_invariants(&commits, &legacy_layout);
+    assert!(
+        legacy_layout.max_lanes >= 5,
+        "expected legacy mode to accumulate dangling lanes, got {}",
+        legacy_layout.max_lanes
+    );
+
+    let truncated_layout = compute_layout_with_options(
+        &commits,
+        None,
+        LayoutOptions {
+            truncate_missing_parents: true,
+        },
+    );
+    assert_layout_invariants(&commits, &truncated_layout);
+    assert_eq!(truncated_layout.max_lanes, 2);
+
+    // Isolated commits at rows 0 and 1 emit no downward edges and stay on lane 0.
+    for row_idx in [0, 1] {
+        assert_eq!(truncated_layout.rows[row_idx].lane, 0);
+        assert_eq!(truncated_layout.rows[row_idx].active_lanes, 1);
+        assert!(truncated_layout.rows[row_idx].segments.is_empty());
+    }
+
+    // g_child (row 2) -> PassThrough at iso3 (row 3), adj_child (row 4) -> adj_parent (row 5) on lane 1,
+    // then g_parent (row 6) closes lane 0 so iso4 (row 7) contracts back to lane 0 with 1 lane.
+    assert_eq!(truncated_layout.rows[2].lane, 0);
+    assert!(truncated_layout.rows[2].segments.iter().any(|s| {
+        s.kind == SegmentKind::NodeToBottom && s.from_lane == 0 && s.to_lane == 0
+    }));
+
+    assert_eq!(truncated_layout.rows[3].lane, 1);
+    assert!(truncated_layout.rows[3].segments.iter().any(|s| {
+        s.kind == SegmentKind::PassThrough && s.from_lane == 0 && s.to_lane == 0
+    }));
+    assert!(
+        !truncated_layout.rows[3]
+            .segments
+            .iter()
+            .any(|s| s.kind == SegmentKind::NodeToBottom)
+    );
+
+    assert_eq!(truncated_layout.rows[4].lane, 1);
+    assert!(truncated_layout.rows[4].segments.iter().any(|s| {
+        s.kind == SegmentKind::NodeToBottom && s.from_lane == 1 && s.to_lane == 1
+    }));
+
+    assert_eq!(truncated_layout.rows[5].lane, 1);
+    assert!(truncated_layout.rows[5].segments.iter().any(|s| {
+        s.kind == SegmentKind::TopToNode && s.from_lane == 1 && s.to_lane == 1
+    }));
+    assert!(
+        !truncated_layout.rows[5]
+            .segments
+            .iter()
+            .any(|s| s.kind == SegmentKind::NodeToBottom)
+    );
+
+    assert_eq!(truncated_layout.rows[6].lane, 0);
+    assert!(truncated_layout.rows[6].segments.iter().any(|s| {
+        s.kind == SegmentKind::TopToNode && s.from_lane == 0 && s.to_lane == 0
+    }));
+    assert!(
+        !truncated_layout.rows[6]
+            .segments
+            .iter()
+            .any(|s| s.kind == SegmentKind::NodeToBottom)
+    );
+
+    assert_eq!(truncated_layout.rows[7].lane, 0);
+    assert_eq!(truncated_layout.rows[7].active_lanes, 1);
+    assert!(truncated_layout.rows[7].segments.is_empty());
+}
+
+#[test]
+fn truncate_missing_parents_preserves_merge_flags_and_node_kind() {
+    let commits = vec![
+        // First parent missing, second parent visible
+        commit("m_partial", &["missing_p1", "p2"]),
+        // Both parents missing
+        commit("m_isolated", &["missing_a", "missing_b"]),
+        commit("p2", &["missing_root"]),
+    ];
+
+    let layout = compute_layout_with_options(
+        &commits,
+        None,
+        LayoutOptions {
+            truncate_missing_parents: true,
+        },
+    );
+    assert_layout_invariants(&commits, &layout);
+    assert_eq!(layout.max_lanes, 2);
+
+    // m_partial keeps Merge identity even though missing_p1 was truncated.
+    assert!(layout.rows[0].is_merge);
+    assert_eq!(layout.rows[0].node_kind, NodeKind::Merge);
+    assert_eq!(layout.rows[0].lane, 0);
+    assert_eq!(
+        layout.rows[0]
+            .segments
+            .iter()
+            .filter(|s| s.kind == SegmentKind::NodeToBottom)
+            .count(),
+        1
+    );
+
+    // m_isolated keeps Merge identity even with all parents truncated.
+    assert!(layout.rows[1].is_merge);
+    assert_eq!(layout.rows[1].node_kind, NodeKind::Merge);
+    assert_eq!(layout.rows[1].lane, 1);
+    assert!(
+        !layout.rows[1]
+            .segments
+            .iter()
+            .any(|s| s.kind == SegmentKind::NodeToBottom)
+    );
+
+    // p2 receives incoming edge from m_partial on lane 0 and truncates missing_root.
+    assert_eq!(layout.rows[2].lane, 0);
+    assert_eq!(layout.rows[2].active_lanes, 1);
+    assert!(layout.rows[2].segments.iter().any(|s| {
+        s.kind == SegmentKind::TopToNode && s.from_lane == 0 && s.to_lane == 0
+    }));
+    assert!(
+        !layout.rows[2]
+            .segments
+            .iter()
+            .any(|s| s.kind == SegmentKind::NodeToBottom)
+    );
+}
+
+#[test]
+fn truncate_missing_parents_handles_uncommitted_row_when_head_visible_or_missing() {
+    let opts = LayoutOptions {
+        truncate_missing_parents: true,
+    };
+
+    // Case 1: HEAD is visible (resolved via head_hash when uncommitted.parents is empty).
+    let visible_head_commits = vec![
+        CommitNode {
+            hash: "*".to_string(),
+            parents: Vec::new(),
+            is_stash: false,
+            is_uncommitted: true,
+        },
+        commit("other", &["missing_parent"]),
+        commit("head_c", &["missing_base"]),
+    ];
+    let visible_layout = compute_layout_with_options(&visible_head_commits, Some("head_c"), opts);
+    assert_layout_invariants(&visible_head_commits, &visible_layout);
+    assert_eq!(visible_layout.rows[0].node_kind, NodeKind::Uncommitted);
+    assert!(visible_layout.rows[0].segments.iter().any(|s| {
+        s.kind == SegmentKind::NodeToBottom && s.from_lane == 0 && s.to_lane == 0 && s.dashed
+    }));
+    assert!(visible_layout.rows[1].segments.iter().any(|s| {
+        s.kind == SegmentKind::PassThrough && s.from_lane == 0 && s.to_lane == 0 && s.dashed
+    }));
+    assert_eq!(visible_layout.rows[2].node_kind, NodeKind::Head);
+    assert!(visible_layout.rows[2].segments.iter().any(|s| {
+        s.kind == SegmentKind::TopToNode && s.from_lane == 0 && s.to_lane == 0 && s.dashed
+    }));
+
+    // Case 2: HEAD is NOT in the visible list (both implicit via head_hash and explicit parent forms).
+    let missing_head_implicit = vec![
+        CommitNode {
+            hash: "*".to_string(),
+            parents: Vec::new(),
+            is_stash: false,
+            is_uncommitted: true,
+        },
+        commit("filtered_c", &["missing_parent"]),
+    ];
+    let layout_implicit =
+        compute_layout_with_options(&missing_head_implicit, Some("hidden_head"), opts);
+    assert_layout_invariants(&missing_head_implicit, &layout_implicit);
+    assert_eq!(layout_implicit.max_lanes, 1);
+    assert_eq!(layout_implicit.rows[0].node_kind, NodeKind::Uncommitted);
+    assert!(layout_implicit.rows[0].segments.is_empty());
+    assert_eq!(layout_implicit.rows[1].lane, 0);
+    assert!(layout_implicit.rows[1].segments.is_empty());
+
+    let missing_head_explicit = vec![
+        CommitNode {
+            hash: "*".to_string(),
+            parents: vec!["hidden_head".to_string()],
+            is_stash: false,
+            is_uncommitted: true,
+        },
+        commit("filtered_c", &["missing_parent"]),
+    ];
+    let layout_explicit =
+        compute_layout_with_options(&missing_head_explicit, Some("hidden_head"), opts);
+    assert_layout_invariants(&missing_head_explicit, &layout_explicit);
+    assert_eq!(layout_explicit.max_lanes, 1);
+    assert_eq!(layout_explicit.rows[0].node_kind, NodeKind::Uncommitted);
+    assert!(layout_explicit.rows[0].segments.is_empty());
+    assert_eq!(layout_explicit.rows[1].lane, 0);
+    assert!(layout_explicit.rows[1].segments.is_empty());
+}
+
+#[test]
+fn truncate_missing_parents_ignores_empty_hashes_and_non_forward_parents() {
+    let commits = vec![
+        commit("c_earlier", &["c_earlier"]), // self-loop should not leak a dangling lane
+        commit("c_child", &["c_earlier", ""]), // parent above current row & empty parent hash
+    ];
+
+    let layout = compute_layout_with_options(
+        &commits,
+        None,
+        LayoutOptions {
+            truncate_missing_parents: true,
+        },
+    );
+    assert_layout_invariants(&commits, &layout);
+    assert_eq!(layout.max_lanes, 1);
+    assert!(layout.rows[0].segments.is_empty());
+    assert!(layout.rows[1].segments.is_empty());
 }

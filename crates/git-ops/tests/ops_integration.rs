@@ -5,8 +5,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use git_graph_ops::{
-    GitCli, OpsError, RepoWatcher, ResetMode, SafetyRisk, WatchEvent, check_checkout_safety,
-    check_reset_safety,
+    BranchSyncStatus, GitCli, OpsError, PushForceMode, PushOptions, RepoWatcher, ResetMode,
+    SafetyRisk, SyncOutcome, WatchEvent, check_checkout_safety, check_reset_safety,
 };
 use tempfile::TempDir;
 
@@ -466,4 +466,372 @@ fn repo_watcher_emits_events_and_stops_on_drop() {
         rx.try_recv(),
         Err(mpsc::TryRecvError::Disconnected)
     ));
+}
+
+fn setup_bare_and_two_clones() -> (TempDir, TempDir, TempDir, GitCli) {
+    let remote_dir = TempDir::new().unwrap();
+    let cli = GitCli::new().unwrap();
+    cli.run(remote_dir.path(), ["init", "--bare", "-b", "main"])
+        .expect("init bare remote");
+
+    let (dir1, _) = init_repo();
+    let repo1 = dir1.path();
+    let remote_url = remote_dir.path().to_str().unwrap();
+    cli.run(repo1, ["remote", "add", "origin", remote_url])
+        .unwrap();
+    cli.run(repo1, ["config", "pull.rebase", "false"]).unwrap();
+    commit_file(&cli, repo1, "base.txt", "base\n", "initial commit");
+    cli.publish_branch(repo1, "origin", "main")
+        .expect("publish initial main");
+
+    let dir2 = TempDir::new().unwrap();
+    let repo2 = dir2.path();
+    cli.run(repo2, ["clone", remote_url, "."]).expect("clone");
+    cli.run(repo2, ["config", "user.name", "Clone User"])
+        .unwrap();
+    cli.run(repo2, ["config", "user.email", "clone@example.com"])
+        .unwrap();
+    cli.run(repo2, ["config", "commit.gpgsign", "false"])
+        .unwrap();
+    cli.run(repo2, ["config", "pull.rebase", "false"]).unwrap();
+
+    (remote_dir, dir1, dir2, cli)
+}
+
+#[test]
+fn branch_sync_status_publish_and_ahead_behind() {
+    // 1. Unborn repo without remotes -> NoUpstream { default_remote: None }
+    let (local_only, cli) = init_repo();
+    assert_eq!(
+        cli.branch_sync_status(local_only.path()).unwrap(),
+        BranchSyncStatus::NoUpstream {
+            branch: "main".to_string(),
+            default_remote: None,
+        }
+    );
+    assert_eq!(
+        cli.list_remotes(local_only.path()).unwrap(),
+        Vec::<String>::new()
+    );
+
+    // Add remotes without `origin` -> alphabetical first remote selected
+    cli.run(
+        local_only.path(),
+        ["remote", "add", "zebra", "https://example.com/z.git"],
+    )
+    .unwrap();
+    cli.run(
+        local_only.path(),
+        ["remote", "add", "alpha", "https://example.com/a.git"],
+    )
+    .unwrap();
+    assert_eq!(
+        cli.list_remotes(local_only.path()).unwrap(),
+        vec!["alpha".to_string(), "zebra".to_string()]
+    );
+    assert_eq!(
+        cli.branch_sync_status(local_only.path()).unwrap(),
+        BranchSyncStatus::NoUpstream {
+            branch: "main".to_string(),
+            default_remote: Some("alpha".to_string()),
+        }
+    );
+
+    // Adding `origin` prefers `origin` over `alpha`
+    cli.run(
+        local_only.path(),
+        ["remote", "add", "origin", "https://example.com/o.git"],
+    )
+    .unwrap();
+    assert_eq!(
+        cli.branch_sync_status(local_only.path()).unwrap(),
+        BranchSyncStatus::NoUpstream {
+            branch: "main".to_string(),
+            default_remote: Some("origin".to_string()),
+        }
+    );
+
+    // 2. Real bare remote: new branch NoUpstream -> publish_branch -> Synced { 0, 0 }
+    let (_remote_dir, dir1, dir2, cli) = setup_bare_and_two_clones();
+    let repo1 = dir1.path();
+    let repo2 = dir2.path();
+
+    cli.create_branch(repo1, "feature", None, true)
+        .expect("create feature");
+    assert_eq!(cli.branch_upstream(repo1, "feature").unwrap(), None);
+    assert_eq!(
+        cli.branch_sync_status(repo1).unwrap(),
+        BranchSyncStatus::NoUpstream {
+            branch: "feature".to_string(),
+            default_remote: Some("origin".to_string()),
+        }
+    );
+
+    cli.publish_branch(repo1, "origin", "feature")
+        .expect("publish feature");
+    assert_eq!(
+        cli.branch_upstream(repo1, "feature").unwrap(),
+        Some("origin/feature".to_string())
+    );
+    assert_eq!(
+        cli.branch_sync_status(repo1).unwrap(),
+        BranchSyncStatus::Synced {
+            branch: "feature".to_string(),
+            upstream: "origin/feature".to_string(),
+            ahead: 0,
+            behind: 0,
+        }
+    );
+
+    // 3. Switch back to main: 2 local commits -> ahead == 2; clone pushes 1 commit -> fetch -> behind == 1, ahead == 2
+    cli.checkout_branch(repo1, "main").unwrap();
+    commit_file(&cli, repo1, "local1.txt", "1\n", "local 1");
+    commit_file(&cli, repo1, "local2.txt", "2\n", "local 2");
+    assert_eq!(
+        cli.branch_sync_status(repo1).unwrap(),
+        BranchSyncStatus::Synced {
+            branch: "main".to_string(),
+            upstream: "origin/main".to_string(),
+            ahead: 2,
+            behind: 0,
+        }
+    );
+
+    commit_file(&cli, repo2, "remote1.txt", "r1\n", "remote 1");
+    cli.push(repo2, Some("origin"), Some("main"), false)
+        .unwrap();
+
+    cli.fetch(repo1, Some("origin"), false).unwrap();
+    assert_eq!(
+        cli.branch_sync_status(repo1).unwrap(),
+        BranchSyncStatus::Synced {
+            branch: "main".to_string(),
+            upstream: "origin/main".to_string(),
+            ahead: 2,
+            behind: 1,
+        }
+    );
+
+    // 4. Detached HEAD -> DetachedHead
+    let head_oid = cli
+        .run(repo1, ["rev-parse", "HEAD"])
+        .unwrap()
+        .stdout
+        .trim()
+        .to_string();
+    cli.checkout_commit(repo1, &head_oid).unwrap();
+    assert_eq!(
+        cli.branch_sync_status(repo1).unwrap(),
+        BranchSyncStatus::DetachedHead
+    );
+}
+
+#[test]
+fn sync_branch_pulls_merges_and_pushes_cleanly() {
+    let (_remote_dir, dir1, dir2, cli) = setup_bare_and_two_clones();
+    let repo1 = dir1.path();
+    let repo2 = dir2.path();
+
+    // Diverge cleanly on separate files
+    commit_file(&cli, repo1, "left1.txt", "l1\n", "left 1");
+    commit_file(&cli, repo1, "left2.txt", "l2\n", "left 2");
+
+    commit_file(&cli, repo2, "right1.txt", "r1\n", "right 1");
+    cli.publish_branch(repo2, "origin", "main").unwrap();
+
+    let outcome = cli.sync_branch(repo1).expect("sync_branch should succeed");
+    assert_eq!(
+        outcome,
+        SyncOutcome {
+            branch: "main".to_string(),
+            upstream: "origin/main".to_string(),
+            pulled: true,
+            pushed: true,
+        }
+    );
+    assert_eq!(
+        cli.branch_sync_status(repo1).unwrap(),
+        BranchSyncStatus::Synced {
+            branch: "main".to_string(),
+            upstream: "origin/main".to_string(),
+            ahead: 0,
+            behind: 0,
+        }
+    );
+
+    // repo2 pulls and observes both local commits from repo1
+    let outcome2 = cli.sync_branch(repo2).expect("repo2 sync_branch");
+    assert_eq!(
+        outcome2,
+        SyncOutcome {
+            branch: "main".to_string(),
+            upstream: "origin/main".to_string(),
+            pulled: true,
+            pushed: false,
+        }
+    );
+    assert_eq!(
+        cli.branch_sync_status(repo2).unwrap(),
+        BranchSyncStatus::Synced {
+            branch: "main".to_string(),
+            upstream: "origin/main".to_string(),
+            ahead: 0,
+            behind: 0,
+        }
+    );
+    assert!(repo2.join("left1.txt").exists());
+    assert!(repo2.join("left2.txt").exists());
+    assert!(repo1.join("right1.txt").exists());
+
+    // Error cases: NoUpstream and DetachedHead
+    cli.create_branch(repo1, "untracked", None, true).unwrap();
+    assert!(matches!(
+        cli.sync_branch(repo1),
+        Err(OpsError::InvalidInput(_))
+    ));
+    let head = cli.run(repo1, ["rev-parse", "HEAD"]).unwrap().stdout;
+    cli.checkout_commit(repo1, head.trim()).unwrap();
+    assert!(matches!(
+        cli.sync_branch(repo1),
+        Err(OpsError::InvalidInput(_))
+    ));
+}
+
+#[test]
+fn push_branch_supports_renaming_tags_and_force_with_lease() {
+    let (remote_dir, dir1, _dir2, cli) = setup_bare_and_two_clones();
+    let repo1 = dir1.path();
+
+    // Create a local branch with a tag and push it to a different remote branch name
+    cli.create_branch(repo1, "local-wip", None, true).unwrap();
+    let c1 = commit_file(&cli, repo1, "feat.txt", "v1\n", "feat v1");
+    cli.create_tag(repo1, "v1.0.0", &c1, Some("release v1"))
+        .unwrap();
+
+    cli.push_branch(
+        repo1,
+        &PushOptions {
+            local_branch: "local-wip".to_string(),
+            remote: "origin".to_string(),
+            remote_branch: "remote-topic".to_string(),
+            set_upstream: true,
+            push_tags: true,
+            force: PushForceMode::None,
+        },
+    )
+    .expect("push_branch to renamed remote branch with tags");
+
+    assert_eq!(
+        cli.branch_upstream(repo1, "local-wip").unwrap(),
+        Some("origin/remote-topic".to_string())
+    );
+    let remote_refs = cli.run(remote_dir.path(), ["show-ref"]).unwrap().stdout;
+    assert!(remote_refs.contains("refs/heads/remote-topic"));
+    assert!(remote_refs.contains("refs/tags/v1.0.0"));
+
+    // Amend commit locally -> normal push rejected, force-with-lease succeeds
+    fs::write(repo1.join("feat.txt"), "v1-amended\n").unwrap();
+    cli.stage_file(repo1, "feat.txt").unwrap();
+    cli.run(repo1, ["commit", "--amend", "--no-edit"])
+        .expect("amend commit");
+
+    let rejected = cli.push_branch(
+        repo1,
+        &PushOptions {
+            local_branch: "local-wip".to_string(),
+            remote: "origin".to_string(),
+            remote_branch: "remote-topic".to_string(),
+            set_upstream: false,
+            push_tags: false,
+            force: PushForceMode::None,
+        },
+    );
+    assert!(matches!(rejected, Err(OpsError::CommandFailed { .. })));
+
+    cli.push_branch(
+        repo1,
+        &PushOptions {
+            local_branch: "local-wip".to_string(),
+            remote: "origin".to_string(),
+            remote_branch: "remote-topic".to_string(),
+            set_upstream: false,
+            push_tags: false,
+            force: PushForceMode::ForceWithLease,
+        },
+    )
+    .expect("force-with-lease push");
+
+    let new_local_oid = cli
+        .run(repo1, ["rev-parse", "HEAD"])
+        .unwrap()
+        .stdout
+        .trim()
+        .to_string();
+    let remote_topic_oid = cli
+        .run(remote_dir.path(), ["rev-parse", "refs/heads/remote-topic"])
+        .unwrap()
+        .stdout
+        .trim()
+        .to_string();
+    assert_eq!(remote_topic_oid, new_local_oid);
+
+    // Input validation rejects empty or flag-like names
+    assert!(matches!(
+        cli.push_branch(
+            repo1,
+            &PushOptions {
+                local_branch: "".to_string(),
+                remote: "origin".to_string(),
+                remote_branch: "main".to_string(),
+                set_upstream: false,
+                push_tags: false,
+                force: PushForceMode::None,
+            },
+        ),
+        Err(OpsError::InvalidInput(_))
+    ));
+}
+
+#[test]
+fn sync_branch_aborts_on_pull_conflict_without_pushing() {
+    let (remote_dir, dir1, dir2, cli) = setup_bare_and_two_clones();
+    let repo1 = dir1.path();
+    let repo2 = dir2.path();
+
+    // Both clones edit base.txt differently
+    commit_file(&cli, repo2, "base.txt", "from repo2\n", "repo2 change");
+    cli.push(repo2, Some("origin"), Some("main"), false)
+        .unwrap();
+    let remote_oid_before = cli
+        .run(remote_dir.path(), ["rev-parse", "refs/heads/main"])
+        .unwrap()
+        .stdout
+        .trim()
+        .to_string();
+
+    commit_file(
+        &cli,
+        repo1,
+        "base.txt",
+        "from repo1\n",
+        "repo1 conflicting change",
+    );
+
+    let err = cli
+        .sync_branch(repo1)
+        .expect_err("sync_branch must fail on merge conflict");
+    assert!(matches!(err, OpsError::CommandFailed { .. }));
+
+    // Remote must NOT have received any push from repo1
+    let remote_oid_after = cli
+        .run(remote_dir.path(), ["rev-parse", "refs/heads/main"])
+        .unwrap()
+        .stdout
+        .trim()
+        .to_string();
+    assert_eq!(remote_oid_after, remote_oid_before);
+
+    // Working tree is in conflict state (UNMERGED) rather than pushed
+    let status = cli.run(repo1, ["status", "--porcelain"]).unwrap().stdout;
+    assert!(status.contains("UU base.txt"));
 }

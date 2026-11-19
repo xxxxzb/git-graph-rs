@@ -1,6 +1,17 @@
 //! Commit graph lane topology layout algorithm.
 
+use std::collections::HashMap;
+
 use crate::model::{CommitNode, GraphLayout, LaneSegment, NodeKind, RowLayout, SegmentKind};
+
+/// Options controlling [`compute_layout_with_options`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LayoutOptions {
+    /// 为 true 时，如果某条提交的 parent 不在当前 `commits` 列表中，
+    /// 则截断该连线（不为其分配向下泳道，避免在搜索/筛选结果中产生悬空线瀑布），
+    /// 仅保留当前可见提交之间的真实父子连线。
+    pub truncate_missing_parents: bool,
+}
 
 #[derive(Clone, Copy)]
 struct ActiveLane<'a> {
@@ -18,13 +29,40 @@ struct ActiveLane<'a> {
 /// across row `i`'s `NodeToBottom` and `PassThrough` segments strictly equals the set of
 /// `from_lane` indices across row `i + 1`'s `TopToNode` and `PassThrough` segments.
 pub fn compute_layout(commits: &[CommitNode], head_hash: Option<&str>) -> GraphLayout {
+    compute_layout_with_options(commits, head_hash, LayoutOptions::default())
+}
+
+/// Computes lane positions, palette colors, node kinds, and per-row line segments for a commit list
+/// with configurable [`LayoutOptions`].
+pub fn compute_layout_with_options(
+    commits: &[CommitNode],
+    head_hash: Option<&str>,
+    options: LayoutOptions,
+) -> GraphLayout {
+    let visible_last_row = options.truncate_missing_parents.then(|| {
+        let mut map = HashMap::with_capacity(commits.len());
+        for (idx, commit) in commits.iter().enumerate() {
+            if !commit.hash.is_empty() {
+                map.insert(commit.hash.as_str(), idx);
+            }
+        }
+        map
+    });
+
     let mut lanes: Vec<Option<ActiveLane<'_>>> = Vec::new();
     let mut rows = Vec::with_capacity(commits.len());
     let mut next_color: usize = 0;
     let mut max_lanes: usize = 0;
 
-    for commit in commits {
-        let row = layout_row(commit, head_hash, &mut lanes, &mut next_color);
+    for (row_idx, commit) in commits.iter().enumerate() {
+        let row = layout_row(
+            commit,
+            head_hash,
+            row_idx,
+            visible_last_row.as_ref(),
+            &mut lanes,
+            &mut next_color,
+        );
         max_lanes = max_lanes.max(row.active_lanes);
         rows.push(row);
     }
@@ -35,6 +73,8 @@ pub fn compute_layout(commits: &[CommitNode], head_hash: Option<&str>) -> GraphL
 fn layout_row<'a>(
     commit: &'a CommitNode,
     head_hash: Option<&'a str>,
+    row_idx: usize,
+    visible_last_row: Option<&HashMap<&'a str, usize>>,
     lanes: &mut Vec<Option<ActiveLane<'a>>>,
     next_color: &mut usize,
 ) -> RowLayout {
@@ -81,7 +121,7 @@ fn layout_row<'a>(
     }
 
     let edge_dashed = commit.is_uncommitted;
-    let parents = collect_effective_parents(commit, head_hash);
+    let parents = collect_effective_parents(commit, head_hash, row_idx, visible_last_row);
 
     for (p_idx, &parent_hash) in parents.iter().enumerate() {
         if p_idx == 0 {
@@ -174,17 +214,29 @@ fn layout_row<'a>(
 fn collect_effective_parents<'a>(
     commit: &'a CommitNode,
     head_hash: Option<&'a str>,
+    row_idx: usize,
+    visible_last_row: Option<&HashMap<&'a str, usize>>,
 ) -> Vec<&'a str> {
+    let is_visible_parent = |hash: &str| -> bool {
+        match visible_last_row {
+            Some(last_row_by_hash) => last_row_by_hash
+                .get(hash)
+                .is_some_and(|&target_idx| target_idx > row_idx),
+            None => true,
+        }
+    };
+
     let mut parents = Vec::with_capacity(commit.parents.len().max(1));
     if !commit.parents.is_empty() {
         for parent in &commit.parents {
             let hash = parent.as_str();
-            if !parents.contains(&hash) {
+            if is_visible_parent(hash) && !parents.contains(&hash) {
                 parents.push(hash);
             }
         }
     } else if commit.is_uncommitted
         && let Some(head) = head_hash
+        && is_visible_parent(head)
     {
         parents.push(head);
     }

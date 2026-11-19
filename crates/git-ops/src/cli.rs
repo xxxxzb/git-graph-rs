@@ -94,6 +94,7 @@ impl GitCli {
             .args(&arg_strings)
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GCM_INTERACTIVE", "never")
+            .env("GIT_MERGE_AUTOEDIT", "no")
             .stdin(Stdio::null())
             .output()?;
 

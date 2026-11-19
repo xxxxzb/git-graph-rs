@@ -2,6 +2,7 @@
 
 use std::cell::Cell;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use ely_core::buttons::{Button, ButtonVariant, IconButton};
 use ely_core::data_display::{Badge, Tone};
@@ -17,7 +18,8 @@ use git_graph_ops::BranchSyncStatus;
 use gpui::{
     AnyElement, App, Context, CursorStyle, DragMoveEvent, EmptyView, FontWeight, Hsla,
     InteractiveElement, IntoElement, KeyDownEvent, MouseButton, ParentElement, Pixels, ScrollEvent,
-    SharedString, StatefulInteractiveElement, Styled, div, prelude::*, px, uniform_list,
+    SharedString, StatefulInteractiveElement, Styled, TouchPhase, div, prelude::*, px,
+    uniform_list,
 };
 
 use crate::app_view::GitGraphApp;
@@ -59,20 +61,140 @@ pub fn max_graph_scroll_x(tab: &RepoTabState, graph_col_w: f32) -> f32 {
     (graph_content_width(tab.layout.max_lanes) - graph_col_w).max(0.0)
 }
 
-/// 从滚动事件中提取主导横向位移（兼容触控板双指左右滑及鼠标 `Shift + 滚轮`）。
-///
-/// 当事件主导方向为竖向（未按 Shift）时返回 `None`，确保不拦截外层列表的竖向滚动。
-pub fn extract_horizontal_scroll_delta(event: &ScrollEvent) -> Option<f32> {
-    let delta = event.delta.pixel_delta(px(ROW_HEIGHT));
-    let dx = f32::from(delta.x);
-    let dy = f32::from(delta.y);
-    if event.modifiers.shift && dx.abs() < 0.01 && dy.abs() > 0.01 {
-        return Some(dy);
+/// 滚动事件的轴向分类结果。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ScrollAxisDecision {
+    /// 横向滑动（附带水平像素增量 `dx`），应拦截冒泡防止外层列表斜向串滚。
+    Horizontal(f32),
+    /// 竖向滚动，应正常放行冒泡给外层 `uniform_list`。
+    Vertical,
+    /// 空帧或尚未确定方向。
+    Neutral,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockedAxis {
+    Horizontal,
+    Vertical,
+}
+
+/// 触控板 / 滚轮手势轴向锁：一旦某次双指手势判定为横向滑动，在整个手势
+/// （含轻微手指斜偏与惯性尾帧）期间持续锁定为横向并拦截向 `uniform_list` 冒泡。
+#[derive(Debug, Default)]
+pub struct HorizontalScrollLatch {
+    axis: Option<LockedAxis>,
+    last_event: Option<Instant>,
+}
+
+impl HorizontalScrollLatch {
+    /// 超过该间隔视为全新滚动手势，自动释放旧轴向锁。
+    const GESTURE_TIMEOUT: Duration = Duration::from_millis(160);
+
+    pub fn classify(&mut self, event: &ScrollEvent) -> ScrollAxisDecision {
+        self.classify_at(event, Instant::now())
     }
-    if dx.abs() > 0.01 && dx.abs() >= dy.abs() {
-        return Some(dx);
+
+    pub fn classify_at(&mut self, event: &ScrollEvent, now: Instant) -> ScrollAxisDecision {
+        let delta = event.delta.pixel_delta(px(ROW_HEIGHT));
+        let dx = f32::from(delta.x);
+        let dy = f32::from(delta.y);
+
+        // Shift + 滚轮（普通鼠标）：始终视为明确的横向滚动，不污染连续触控板锁
+        if event.modifiers.shift {
+            if dx.abs() > 0.01 {
+                return ScrollAxisDecision::Horizontal(dx);
+            }
+            if dy.abs() > 0.01 {
+                return ScrollAxisDecision::Horizontal(dy);
+            }
+            return ScrollAxisDecision::Neutral;
+        }
+
+        // 离散鼠标滚轮（非精确触控板）按单帧主导轴判定
+        if !event.delta.precise() {
+            self.axis = None;
+            self.last_event = None;
+            if dx.abs() > 0.01 && dx.abs() >= dy.abs() {
+                return ScrollAxisDecision::Horizontal(dx);
+            }
+            if dy.abs() > 0.01 {
+                return ScrollAxisDecision::Vertical;
+            }
+            return ScrollAxisDecision::Neutral;
+        }
+
+        // Cancelled 时立即复位；Ended（手指抬起）保留轴向锁以覆盖紧随其后的 macOS 惯性滑行帧，
+        // 直到下一次 TouchPhase::Started 或超过 GESTURE_TIMEOUT 自动解锁。
+        if event.touch_phase == TouchPhase::Cancelled {
+            let prev = self.axis.take();
+            self.last_event = None;
+            return match prev {
+                Some(LockedAxis::Horizontal) => ScrollAxisDecision::Horizontal(dx),
+                Some(LockedAxis::Vertical) => ScrollAxisDecision::Vertical,
+                None => ScrollAxisDecision::Neutral,
+            };
+        }
+
+        if event.touch_phase == TouchPhase::Ended {
+            self.last_event = Some(now);
+            return match self.axis {
+                Some(LockedAxis::Horizontal) => ScrollAxisDecision::Horizontal(dx),
+                Some(LockedAxis::Vertical) => ScrollAxisDecision::Vertical,
+                None if dx.abs() > 0.01 && dx.abs() >= dy.abs() => {
+                    ScrollAxisDecision::Horizontal(dx)
+                }
+                None if dy.abs() > 0.01 => ScrollAxisDecision::Vertical,
+                None => ScrollAxisDecision::Neutral,
+            };
+        }
+
+        let timed_out = self
+            .last_event
+            .is_some_and(|prev| now.saturating_duration_since(prev) > Self::GESTURE_TIMEOUT);
+        if event.touch_phase == TouchPhase::Started || timed_out {
+            self.axis = None;
+        }
+        self.last_event = Some(now);
+
+        if dx.abs() <= 0.01 && dy.abs() <= 0.01 {
+            return match self.axis {
+                Some(LockedAxis::Horizontal) => ScrollAxisDecision::Horizontal(0.0),
+                Some(LockedAxis::Vertical) => ScrollAxisDecision::Vertical,
+                None => ScrollAxisDecision::Neutral,
+            };
+        }
+
+        let axis = match self.axis {
+            Some(LockedAxis::Horizontal) => {
+                // 仅当用户明显大幅转成纯竖滑时才主动解锁
+                if dy.abs() > 8.0 && dy.abs() > dx.abs() * 2.5 {
+                    LockedAxis::Vertical
+                } else {
+                    LockedAxis::Horizontal
+                }
+            }
+            Some(LockedAxis::Vertical) => {
+                if dx.abs() > 8.0 && dx.abs() > dy.abs() * 2.5 {
+                    LockedAxis::Horizontal
+                } else {
+                    LockedAxis::Vertical
+                }
+            }
+            None => {
+                if dx.abs() >= dy.abs() {
+                    LockedAxis::Horizontal
+                } else {
+                    LockedAxis::Vertical
+                }
+            }
+        };
+        self.axis = Some(axis);
+
+        match axis {
+            LockedAxis::Horizontal => ScrollAxisDecision::Horizontal(dx),
+            LockedAxis::Vertical => ScrollAxisDecision::Vertical,
+        }
     }
-    None
 }
 
 fn desc_scroll_id(tab_id: u64, row_ix: usize) -> usize {
@@ -630,13 +752,16 @@ pub fn render_graph_table(
                             .w(px(graph_col_w))
                             .h(row_h)
                             .on_scroll(move |event: &ScrollEvent, _, cx| {
-                                if max_graph_scroll > 0.0
-                                    && let Some(dx) = extract_horizontal_scroll_delta(event)
-                                {
+                                let decision = weak_graph_scroll
+                                    .update(cx, |this, _| this.classify_scroll_axis(event))
+                                    .unwrap_or(ScrollAxisDecision::Neutral);
+                                if let ScrollAxisDecision::Horizontal(dx) = decision {
                                     cx.stop_propagation();
-                                    weak_graph_scroll
-                                        .update(cx, |this, cx| this.scroll_graph_x(dx, cx))
-                                        .ok();
+                                    if max_graph_scroll > 0.0 && dx.abs() > 0.01 {
+                                        weak_graph_scroll
+                                            .update(cx, |this, cx| this.scroll_graph_x(dx, cx))
+                                            .ok();
+                                    }
                                 }
                             })
                             .child(graph_cell_canvas);
@@ -868,13 +993,16 @@ fn render_table_header(
         .justify_between()
         .px_2()
         .on_scroll(move |event: &ScrollEvent, _, cx| {
-            if max_graph_scroll > 0.0
-                && let Some(dx) = extract_horizontal_scroll_delta(event)
-            {
+            let decision = weak_header_scroll
+                .update(cx, |this, _| this.classify_scroll_axis(event))
+                .unwrap_or(ScrollAxisDecision::Neutral);
+            if let ScrollAxisDecision::Horizontal(dx) = decision {
                 cx.stop_propagation();
-                weak_header_scroll
-                    .update(cx, |this, cx| this.scroll_graph_x(dx, cx))
-                    .ok();
+                if max_graph_scroll > 0.0 && dx.abs() > 0.01 {
+                    weak_header_scroll
+                        .update(cx, |this, cx| this.scroll_graph_x(dx, cx))
+                        .ok();
+                }
             }
         })
         .child(col_label("图形"))
@@ -1001,13 +1129,26 @@ fn render_description_cell(
         FontWeight::NORMAL
     };
 
+    let weak_desc_scroll = weak.clone();
     div()
+        .id(("desc-cell", desc_scroll_id(tab_id, row_ix)))
         .flex_1()
         .min_w(px(180.0))
         .h_full()
         .overflow_hidden()
         .border_r_1()
         .border_color(colors.border.opacity(0.35))
+        .on_scroll(move |event: &ScrollEvent, _, cx| {
+            // 内层 desc-scroll 已在冒泡前完成 X 轴滚动；
+            // 若当前手势判定为横向（含轻微斜向抖动与惯性尾帧），在此截停冒泡，
+            // 防止残留的微弱 dy 传递到外层 uniform_list 引起画面上下晃动。
+            let decision = weak_desc_scroll
+                .update(cx, |this, _| this.classify_scroll_axis(event))
+                .unwrap_or(ScrollAxisDecision::Neutral);
+            if matches!(decision, ScrollAxisDecision::Horizontal(_)) {
+                cx.stop_propagation();
+            }
+        })
         .child(
             div()
                 .id(("desc-scroll", desc_scroll_id(tab_id, row_ix)))
@@ -1344,9 +1485,7 @@ mod tests {
     }
 
     #[test]
-    fn graph_horizontal_scroll_bounds_and_event_extraction() {
-        use gpui::{Modifiers, ScrollDelta, point};
-
+    fn graph_horizontal_scroll_bounds() {
         let (_dir, engine) = init_empty_repo();
         let mut tab = RepoTabState::new(1, engine);
 
@@ -1359,31 +1498,81 @@ mod tests {
         tab.layout.max_lanes = 25;
         assert_eq!(graph_content_width(25), 424.0);
         assert_eq!(max_graph_scroll_x(&tab, 260.0), 164.0);
+    }
 
-        // 横向主导滚动被提取
-        let horiz = ScrollEvent {
-            delta: ScrollDelta::Pixels(point(px(-24.0), px(4.0))),
+    #[test]
+    fn horizontal_scroll_latch_locks_axis_across_jitter_and_resets_on_new_gesture() {
+        use gpui::{Modifiers, ScrollDelta, point};
+
+        let mut latch = HorizontalScrollLatch::default();
+        let t0 = Instant::now();
+
+        // 1. 触控板开始横向右滑（附带少量垂直分量 dy=2.5）-> 锁定横向
+        let start = ScrollEvent {
+            delta: ScrollDelta::Pixels(point(px(-14.0), px(2.5))),
+            touch_phase: TouchPhase::Started,
             ..Default::default()
         };
-        assert_eq!(extract_horizontal_scroll_delta(&horiz), Some(-24.0));
+        assert_eq!(
+            latch.classify_at(&start, t0),
+            ScrollAxisDecision::Horizontal(-14.0)
+        );
 
-        // 竖向主导滚动不拦截（放行给 uniform_list）
-        let vert = ScrollEvent {
-            delta: ScrollDelta::Pixels(point(px(2.0), px(-30.0))),
+        // 2. 滑动中段手指轻微抖斜（dy 略大于 dx 但未达到大幅转竖滑阈值）-> 仍锁死横向，不让外层列表上下动
+        let jitter = ScrollEvent {
+            delta: ScrollDelta::Pixels(point(px(-3.0), px(4.5))),
+            touch_phase: TouchPhase::Moved,
             ..Default::default()
         };
-        assert_eq!(extract_horizontal_scroll_delta(&vert), None);
+        assert_eq!(
+            latch.classify_at(&jitter, t0 + Duration::from_millis(16)),
+            ScrollAxisDecision::Horizontal(-3.0)
+        );
 
-        // 鼠标 Shift + 滚轮自动映射为横向滚动
-        let shift_wheel = ScrollEvent {
-            delta: ScrollDelta::Pixels(point(px(0.0), px(-18.0))),
+        // 3. 手指抬起 (Ended) 及紧随其后的惯性滑行帧 -> 全程保持横向锁定不串滚
+        let ended = ScrollEvent {
+            delta: ScrollDelta::Pixels(point(px(-1.0), px(2.0))),
+            touch_phase: TouchPhase::Ended,
+            ..Default::default()
+        };
+        assert_eq!(
+            latch.classify_at(&ended, t0 + Duration::from_millis(32)),
+            ScrollAxisDecision::Horizontal(-1.0)
+        );
+        let momentum = ScrollEvent {
+            delta: ScrollDelta::Pixels(point(px(-0.8), px(1.5))),
+            touch_phase: TouchPhase::Moved,
+            ..Default::default()
+        };
+        assert_eq!(
+            latch.classify_at(&momentum, t0 + Duration::from_millis(48)),
+            ScrollAxisDecision::Horizontal(-0.8)
+        );
+
+        // 4. 新手势开始竖向滚动 -> 立即释放旧锁，判定为 Vertical 放行给 uniform_list
+        let next_vert = ScrollEvent {
+            delta: ScrollDelta::Pixels(point(px(1.0), px(-20.0))),
+            touch_phase: TouchPhase::Started,
+            ..Default::default()
+        };
+        assert_eq!(
+            latch.classify_at(&next_vert, t0 + Duration::from_millis(64)),
+            ScrollAxisDecision::Vertical
+        );
+
+        // 5. Shift + 鼠标滚轮 -> 始终判定为横向
+        let shift_mouse = ScrollEvent {
+            delta: ScrollDelta::Lines(point(0.0, -2.0)),
             modifiers: Modifiers {
                 shift: true,
                 ..Default::default()
             },
             ..Default::default()
         };
-        assert_eq!(extract_horizontal_scroll_delta(&shift_wheel), Some(-18.0));
+        assert!(matches!(
+            latch.classify_at(&shift_mouse, t0 + Duration::from_millis(80)),
+            ScrollAxisDecision::Horizontal(_)
+        ));
     }
 
     #[test]

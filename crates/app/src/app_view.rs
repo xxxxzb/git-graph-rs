@@ -75,6 +75,7 @@ pub struct GitGraphApp {
     pub context_menu: Option<ContextMenuState>,
     pub next_ctx_request_id: u64,
     pub cli: Option<GitCli>,
+    pub scroll_latch: crate::ui_graph::HorizontalScrollLatch,
 }
 
 impl GitGraphApp {
@@ -118,6 +119,7 @@ impl GitGraphApp {
             context_menu: None,
             next_ctx_request_id: 1,
             cli,
+            scroll_latch: crate::ui_graph::HorizontalScrollLatch::default(),
         };
 
         for path in initial_repos {
@@ -890,6 +892,14 @@ impl GitGraphApp {
         }
         self.save_state();
         cx.notify();
+    }
+
+    /// 分类当前滚动事件的轴向意图（用于横向手势期间锁死外层列表，避免斜向串滚）。
+    pub fn classify_scroll_axis(
+        &mut self,
+        event: &gpui::ScrollEvent,
+    ) -> crate::ui_graph::ScrollAxisDecision {
+        self.scroll_latch.classify(event)
     }
 
     /// 水平滚动当前活动仓库的图形列（整列同步平移，保持跨行泳道对齐）。

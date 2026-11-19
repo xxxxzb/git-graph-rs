@@ -121,6 +121,8 @@ pub struct RepoTabState {
     pub error: Option<String>,
 
     pub graph_scroll: UniformListScrollHandle,
+    /// 图形列水平滚动偏移（px，>= 0，整列共享以保持跨行泳道连线严格对齐）。
+    pub graph_scroll_x: f32,
     pub _watcher: Option<RepoWatcher>,
     pub _watch_task: Option<Task<()>>,
 }
@@ -170,6 +172,7 @@ impl RepoTabState {
             sync_action_label: None,
             error: None,
             graph_scroll: UniformListScrollHandle::new(),
+            graph_scroll_x: 0.0,
             _watcher: None,
             _watch_task: None,
         }

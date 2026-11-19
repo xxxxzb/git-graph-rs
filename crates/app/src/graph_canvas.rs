@@ -49,11 +49,15 @@ pub struct GraphCellStyle {
     pub col_width: Pixels,
     pub row_height: Pixels,
     pub lane_width: Pixels,
+    pub scroll_x: f32,
+    pub has_overflow_left: bool,
+    pub has_overflow_right: bool,
     pub dark: bool,
     pub row_bg: Hsla,
     pub muted_color: Hsla,
     pub stash_color: Hsla,
     pub border_color: Hsla,
+    pub overflow_hint_color: Hsla,
 }
 
 /// 渲染单行的图形列单元格。
@@ -62,17 +66,21 @@ pub fn paint_graph_cell(row: RowLayout, style: GraphCellStyle) -> AnyElement {
         col_width,
         row_height,
         lane_width,
+        scroll_x,
+        has_overflow_left,
+        has_overflow_right,
         dark,
         row_bg,
         muted_color,
         stash_color,
         border_color,
+        overflow_hint_color,
     } = style;
     canvas(
         |_, _, _| {},
         move |bounds: Bounds<Pixels>, _, window, _| {
             window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
-                let left_pad = px(10.0);
+                let left_pad = px(10.0) - px(scroll_x.max(0.0));
                 let lane_x = |lane: usize| -> Pixels {
                     bounds.origin.x + left_pad + lane_width * (lane as f32 + 0.5)
                 };
@@ -114,6 +122,24 @@ pub fn paint_graph_cell(row: RowLayout, style: GraphCellStyle) -> AnyElement {
                     muted_color,
                     stash_color,
                 );
+
+                // 3. 左右存在可滚动泳道时，在列边缘绘制极淡的 2px 溢出提示
+                let hint_w = px(2.0);
+                if has_overflow_left {
+                    window.paint_quad(fill(
+                        Bounds::new(bounds.origin, size(hint_w, bounds.size.height)),
+                        overflow_hint_color,
+                    ));
+                }
+                if has_overflow_right {
+                    window.paint_quad(fill(
+                        Bounds::new(
+                            point(bounds.origin.x + bounds.size.width - hint_w, bounds.origin.y),
+                            size(hint_w, bounds.size.height),
+                        ),
+                        overflow_hint_color,
+                    ));
+                }
             });
         },
     )

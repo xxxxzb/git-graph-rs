@@ -877,6 +877,12 @@ impl GitGraphApp {
             ResizeCol::Graph => {
                 self.persisted.column_widths.graph = width;
                 self.persisted.column_widths.graph_manual = true;
+                let widths = self.persisted.column_widths.clone();
+                if let Some(tab) = self.active_tab_mut() {
+                    let effective = crate::ui_graph::effective_graph_width(tab, &widths);
+                    let max_scroll = crate::ui_graph::max_graph_scroll_x(tab, effective);
+                    tab.graph_scroll_x = tab.graph_scroll_x.clamp(0.0, max_scroll);
+                }
             }
             ResizeCol::Date => self.persisted.column_widths.date = width,
             ResizeCol::Author => self.persisted.column_widths.author = width,
@@ -884,6 +890,32 @@ impl GitGraphApp {
         }
         self.save_state();
         cx.notify();
+    }
+
+    /// 水平滚动当前活动仓库的图形列（整列同步平移，保持跨行泳道对齐）。
+    pub fn scroll_graph_x(&mut self, delta_x: f32, cx: &mut Context<Self>) {
+        let widths = self.persisted.column_widths.clone();
+        let Some(tab) = self.active_tab_mut() else {
+            return;
+        };
+        let graph_col_w = crate::ui_graph::effective_graph_width(tab, &widths);
+        let max_scroll = crate::ui_graph::max_graph_scroll_x(tab, graph_col_w);
+        let next = (tab.graph_scroll_x - delta_x).clamp(0.0, max_scroll);
+        if (next - tab.graph_scroll_x).abs() > 0.01 {
+            tab.graph_scroll_x = next;
+            cx.notify();
+        }
+    }
+
+    /// 将当前活动仓库图形列的水平滚动位置一键复位到最左侧。
+    pub fn reset_graph_scroll_x(&mut self, cx: &mut Context<Self>) {
+        let Some(tab) = self.active_tab_mut() else {
+            return;
+        };
+        if tab.graph_scroll_x > 0.0 {
+            tab.graph_scroll_x = 0.0;
+            cx.notify();
+        }
     }
 
     pub fn set_vertical_split(&mut self, sizes: [f32; 2]) {

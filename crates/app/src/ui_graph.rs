@@ -16,7 +16,7 @@ use git_graph_layout::{RefBadge, RowLayout, group_ref_badges};
 use git_graph_ops::BranchSyncStatus;
 use gpui::{
     AnyElement, App, Context, CursorStyle, DragMoveEvent, EmptyView, FontWeight, Hsla,
-    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, ParentElement, Pixels,
+    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, ParentElement, Pixels, ScrollEvent,
     SharedString, StatefulInteractiveElement, Styled, div, prelude::*, px, uniform_list,
 };
 
@@ -46,8 +46,39 @@ pub fn effective_graph_width(tab: &RepoTabState, widths: &ColumnWidths) -> f32 {
             .graph
             .clamp(GRAPH_MANUAL_MIN_WIDTH, GRAPH_MANUAL_MAX_WIDTH);
     }
-    let lanes = tab.layout.max_lanes.max(1) as f32;
-    (lanes * LANE_WIDTH + 24.0).clamp(76.0, 260.0)
+    graph_content_width(tab.layout.max_lanes).clamp(76.0, 260.0)
+}
+
+/// 图形列完整内容所需的水平宽度（按泳道数计算）。
+pub fn graph_content_width(max_lanes: usize) -> f32 {
+    max_lanes.max(1) as f32 * LANE_WIDTH + 24.0
+}
+
+/// 图形列允许的最大水平滚动偏移（px）。
+pub fn max_graph_scroll_x(tab: &RepoTabState, graph_col_w: f32) -> f32 {
+    (graph_content_width(tab.layout.max_lanes) - graph_col_w).max(0.0)
+}
+
+/// 从滚动事件中提取主导横向位移（兼容触控板双指左右滑及鼠标 `Shift + 滚轮`）。
+///
+/// 当事件主导方向为竖向（未按 Shift）时返回 `None`，确保不拦截外层列表的竖向滚动。
+pub fn extract_horizontal_scroll_delta(event: &ScrollEvent) -> Option<f32> {
+    let delta = event.delta.pixel_delta(px(ROW_HEIGHT));
+    let dx = f32::from(delta.x);
+    let dy = f32::from(delta.y);
+    if event.modifiers.shift && dx.abs() < 0.01 && dy.abs() > 0.01 {
+        return Some(dy);
+    }
+    if dx.abs() > 0.01 && dx.abs() >= dy.abs() {
+        return Some(dx);
+    }
+    None
+}
+
+fn desc_scroll_id(tab_id: u64, row_ix: usize) -> usize {
+    (tab_id as usize)
+        .wrapping_mul(1_000_003)
+        .wrapping_add(row_ix)
 }
 
 /// 同步按钮点击对应的动作类型。
@@ -428,9 +459,18 @@ pub fn render_graph_table(
     let colors = theme.colors.clone();
     let widths = app.persisted.column_widths.clone();
     let graph_col_w = effective_graph_width(tab, &widths);
+    let max_graph_scroll = max_graph_scroll_x(tab, graph_col_w);
+    let graph_scroll_x = tab.graph_scroll_x.clamp(0.0, max_graph_scroll);
     let weak = cx.weak_entity();
 
-    let header = render_table_header(graph_col_w, &widths, weak.clone(), cx);
+    let header = render_table_header(
+        graph_col_w,
+        graph_scroll_x,
+        max_graph_scroll,
+        &widths,
+        weak.clone(),
+        cx,
+    );
 
     let total_rows = tab.visible_commit_count();
     let show_load_more = tab.more_available && !tab.is_search_active();
@@ -564,21 +604,45 @@ pub fn render_graph_table(
                         };
 
                         let lane_accent = lane_color(row_layout.color_index, dark);
-                        let graph_cell = paint_graph_cell(
+                        let has_overflow_left = graph_scroll_x > 0.5;
+                        let has_overflow_right = max_graph_scroll - graph_scroll_x > 0.5;
+                        let graph_cell_canvas = paint_graph_cell(
                             row_layout,
                             GraphCellStyle {
                                 col_width: px(graph_col_w),
                                 row_height: row_h,
                                 lane_width: px(LANE_WIDTH),
+                                scroll_x: graph_scroll_x,
+                                has_overflow_left,
+                                has_overflow_right,
                                 dark,
                                 row_bg: if is_selected { colors.bg } else { row_bg },
                                 muted_color: colors.fg_subtle,
                                 stash_color: colors.success,
                                 border_color: colors.border.opacity(0.6),
+                                overflow_hint_color: colors.accent.opacity(0.28),
                             },
                         );
+                        let weak_graph_scroll = weak.clone();
+                        let graph_cell = div()
+                            .id(("graph-cell", ix))
+                            .flex_none()
+                            .w(px(graph_col_w))
+                            .h(row_h)
+                            .on_scroll(move |event: &ScrollEvent, _, cx| {
+                                if max_graph_scroll > 0.0
+                                    && let Some(dx) = extract_horizontal_scroll_delta(event)
+                                {
+                                    cx.stop_propagation();
+                                    weak_graph_scroll
+                                        .update(cx, |this, cx| this.scroll_graph_x(dx, cx))
+                                        .ok();
+                                }
+                            })
+                            .child(graph_cell_canvas);
 
                         let desc_cell = render_description_cell(
+                            tab_id,
                             ix,
                             commit,
                             &badges,
@@ -737,6 +801,8 @@ fn render_load_more_row(
 
 fn render_table_header(
     graph_col_w: f32,
+    graph_scroll_x: f32,
+    max_graph_scroll: f32,
     widths: &ColumnWidths,
     weak: gpui::WeakEntity<GitGraphApp>,
     cx: &App,
@@ -789,6 +855,52 @@ fn render_table_header(
         .bottom_0()
         .right(px(-3.0));
 
+    let weak_header_scroll = weak.clone();
+    let weak_reset_scroll = weak.clone();
+    let graph_header_cell = div()
+        .id("graph-col-header")
+        .relative()
+        .flex_none()
+        .w(px(graph_col_w))
+        .h_full()
+        .flex()
+        .items_center()
+        .justify_between()
+        .px_2()
+        .on_scroll(move |event: &ScrollEvent, _, cx| {
+            if max_graph_scroll > 0.0
+                && let Some(dx) = extract_horizontal_scroll_delta(event)
+            {
+                cx.stop_propagation();
+                weak_header_scroll
+                    .update(cx, |this, cx| this.scroll_graph_x(dx, cx))
+                    .ok();
+            }
+        })
+        .child(col_label("图形"))
+        .when(graph_scroll_x > 0.5, |el| {
+            let fg = colors.accent;
+            let hover_bg = colors.hover;
+            el.child(
+                div()
+                    .id("reset-graph-scroll-btn")
+                    .px_1()
+                    .rounded(theme.radius(Radius::Sm))
+                    .text_size(theme.text_size(TextSize::Xs))
+                    .text_color(fg)
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(hover_bg))
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        cx.stop_propagation();
+                        weak_reset_scroll
+                            .update(cx, |this, cx| this.reset_graph_scroll_x(cx))
+                            .ok();
+                    })
+                    .child("↺"),
+            )
+        })
+        .child(graph_drag_handle);
+
     div()
         .id("graph-table-header")
         .w_full()
@@ -823,18 +935,7 @@ fn render_table_header(
             })
             .ok();
         })
-        .child(
-            div()
-                .relative()
-                .flex_none()
-                .w(px(graph_col_w))
-                .h_full()
-                .flex()
-                .items_center()
-                .px_2()
-                .child(col_label("图形"))
-                .child(graph_drag_handle),
-        )
+        .child(graph_header_cell)
         .child(
             div()
                 .flex_1()
@@ -871,6 +972,7 @@ fn render_table_header(
 
 #[allow(clippy::too_many_arguments)]
 fn render_description_cell(
+    tab_id: u64,
     row_ix: usize,
     commit: &GitCommit,
     badges: &[RefBadge],
@@ -902,34 +1004,43 @@ fn render_description_cell(
     div()
         .flex_1()
         .min_w(px(180.0))
-        .px_2()
-        .flex()
-        .items_center()
-        .gap_1p5()
+        .h_full()
         .overflow_hidden()
-        .children(badges.iter().enumerate().map(|(b_ix, badge)| {
-            render_ref_badge(
-                row_ix,
-                b_ix,
-                badge,
-                lane_accent,
-                commit,
-                repo_path,
-                weak,
-                cx,
-            )
-        }))
+        .border_r_1()
+        .border_color(colors.border.opacity(0.35))
         .child(
             div()
-                .flex_1()
-                .min_w_0()
-                .text_size(theme.text_size(TextSize::Sm))
-                .font_weight(msg_weight)
-                .text_color(msg_color)
-                .overflow_hidden()
-                .whitespace_nowrap()
-                .text_ellipsis()
-                .child(commit.message.clone()),
+                .id(("desc-scroll", desc_scroll_id(tab_id, row_ix)))
+                .w_full()
+                .h_full()
+                .px_2()
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .overflow_x_scroll()
+                .restrict_scroll_to_axis()
+                .children(badges.iter().enumerate().map(|(b_ix, badge)| {
+                    render_ref_badge(
+                        row_ix,
+                        b_ix,
+                        badge,
+                        lane_accent,
+                        commit,
+                        repo_path,
+                        weak,
+                        cx,
+                    )
+                }))
+                .child(
+                    div()
+                        .flex_none()
+                        .pr_3()
+                        .text_size(theme.text_size(TextSize::Sm))
+                        .font_weight(msg_weight)
+                        .text_color(msg_color)
+                        .whitespace_nowrap()
+                        .child(commit.message.clone()),
+                ),
         )
         .into_any_element()
 }
@@ -1230,6 +1341,49 @@ mod tests {
         assert_eq!(effective_graph_width(&tab, &widths), 72.0);
         widths.graph = 600.0;
         assert_eq!(effective_graph_width(&tab, &widths), 360.0);
+    }
+
+    #[test]
+    fn graph_horizontal_scroll_bounds_and_event_extraction() {
+        use gpui::{Modifiers, ScrollDelta, point};
+
+        let (_dir, engine) = init_empty_repo();
+        let mut tab = RepoTabState::new(1, engine);
+
+        // 5 条泳道内容宽 104px，列宽 120px 时不可滚动
+        tab.layout.max_lanes = 5;
+        assert_eq!(graph_content_width(5), 104.0);
+        assert_eq!(max_graph_scroll_x(&tab, 120.0), 0.0);
+
+        // 25 条泳道内容宽 424px，列宽 260px 时最大可滚 164px
+        tab.layout.max_lanes = 25;
+        assert_eq!(graph_content_width(25), 424.0);
+        assert_eq!(max_graph_scroll_x(&tab, 260.0), 164.0);
+
+        // 横向主导滚动被提取
+        let horiz = ScrollEvent {
+            delta: ScrollDelta::Pixels(point(px(-24.0), px(4.0))),
+            ..Default::default()
+        };
+        assert_eq!(extract_horizontal_scroll_delta(&horiz), Some(-24.0));
+
+        // 竖向主导滚动不拦截（放行给 uniform_list）
+        let vert = ScrollEvent {
+            delta: ScrollDelta::Pixels(point(px(2.0), px(-30.0))),
+            ..Default::default()
+        };
+        assert_eq!(extract_horizontal_scroll_delta(&vert), None);
+
+        // 鼠标 Shift + 滚轮自动映射为横向滚动
+        let shift_wheel = ScrollEvent {
+            delta: ScrollDelta::Pixels(point(px(0.0), px(-18.0))),
+            modifiers: Modifiers {
+                shift: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(extract_horizontal_scroll_delta(&shift_wheel), Some(-18.0));
     }
 
     #[test]

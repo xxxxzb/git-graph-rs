@@ -249,7 +249,7 @@ pub fn sync_button_spec(
         }) => {
             if *ahead > 0 || *behind > 0 {
                 SyncButtonSpec {
-                    status_bar_label: format!("↻ ↓{behind} ↑{ahead}"),
+                    status_bar_label: format!("↓{behind} ↑{ahead}"),
                     tooltip: format!(
                         "与 {upstream} 同步（拉取 {behind} / 推送 {ahead}，遵循本机 git pull 配置）"
                     ),
@@ -1768,7 +1768,7 @@ mod tests {
         assert!(!clean_spec.disabled);
         assert_eq!(clean_spec.action, SyncButtonAction::Sync);
 
-        // 2. Synced(ahead=2, behind=1) -> 状态栏清晰显示 ↻ ↓1 ↑2
+        // 2. Synced(ahead=2, behind=1) -> 状态栏清晰显示 ↓1 ↑2（图标由 IconName::RefreshCw 提供，不重复）
         let diverged = BranchSyncStatus::Synced {
             branch: "main".to_string(),
             upstream: "origin/main".to_string(),
@@ -1776,7 +1776,7 @@ mod tests {
             behind: 1,
         };
         let div_spec = sync_button_spec(Some(&diverged), false, None);
-        assert_eq!(div_spec.status_bar_label, "↻ ↓1 ↑2");
+        assert_eq!(div_spec.status_bar_label, "↓1 ↑2");
         assert!(!div_spec.disabled);
         assert!(div_spec.tooltip.contains("origin/main"));
         assert_eq!(div_spec.action, SyncButtonAction::Sync);

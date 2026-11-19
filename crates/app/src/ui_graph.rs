@@ -508,18 +508,6 @@ pub fn render_filter_toolbar(
             }
         });
 
-    let refresh_btn = IconButton::new("refresh-graph-btn", IconName::RefreshCw)
-        .variant(ButtonVariant::Ghost)
-        .size(ControlSize::Sm)
-        .tooltip("刷新仓库图谱")
-        .on_click({
-            let weak = weak.clone();
-            move |_, _, cx| {
-                weak.update(cx, |this, cx| this.refresh_active_tab(false, cx))
-                    .ok();
-            }
-        });
-
     div()
         .w_full()
         .bg(colors.surface)
@@ -543,8 +531,7 @@ pub fn render_filter_toolbar(
                 .child(
                     ToolbarGroup::new()
                         .child(jump_head_btn)
-                        .child(toggle_details_btn)
-                        .child(refresh_btn),
+                        .child(toggle_details_btn),
                 ),
         )
         .into_any_element()

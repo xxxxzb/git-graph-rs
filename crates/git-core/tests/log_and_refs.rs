@@ -1,0 +1,827 @@
+//! The commit walk and the ref scan, checked against what git itself reports.
+
+#[macro_use]
+mod common;
+
+use git_graph_core::log::{self, WalkOptions};
+use git_graph_core::refs::read_refs;
+use git_graph_core::repository::Repo;
+use git_graph_core::types::{CommitOrdering, RefReadOptions};
+
+use common::TestRepo;
+
+fn open(repo: &TestRepo) -> Repo {
+    Repo::discover(repo.path()).expect("could not open the fixture repository")
+}
+
+fn walk_all(repo: &TestRepo, limit: usize, ordering: CommitOrdering) -> Vec<String> {
+    let engine = open(repo);
+    let tips = log::all_tips(&engine, true, true).expect("could not resolve the tips");
+    let options = WalkOptions {
+        limit,
+        ordering,
+        ..Default::default()
+    };
+    log::walk(&engine, &tips, &options)
+        .expect("the walk failed")
+        .into_iter()
+        .map(|record| record.hash)
+        .collect()
+}
+
+#[test]
+fn walks_a_linear_history_in_the_same_order_as_git() {
+    require_git!();
+    let mut repo = TestRepo::new();
+    repo.commit_file("a.txt", "1", "first");
+    repo.commit_file("b.txt", "2", "second");
+    repo.commit_file("c.txt", "3", "third");
+
+    let expected = repo.log_hashes(&["--date-order", "--all"]);
+    assert_eq!(walk_all(&repo, 100, CommitOrdering::Date), expected);
+}
+
+#[test]
+fn walks_a_branching_history_in_the_same_order_as_git() {
+    require_git!();
+    let mut repo = TestRepo::new();
+    repo.commit_file("a.txt", "1", "base");
+    repo.git(&["checkout", "--quiet", "-b", "feature"]);
+    repo.commit_file("feature.txt", "f", "feature work");
+    repo.git(&["checkout", "--quiet", "main"]);
+    repo.commit_file("main.txt", "m", "main work");
+    repo.git(&[
+        "merge",
+        "--quiet",
+        "--no-ff",
+        "-m",
+        "merge feature",
+        "feature",
+    ]);
+
+    let expected = repo.log_hashes(&["--date-order", "--all"]);
+    assert_eq!(walk_all(&repo, 100, CommitOrdering::Date), expected);
+}
+
+#[test]
+fn never_shows_a_parent_before_its_child() {
+    require_git!();
+    let mut repo = TestRepo::new();
+    repo.commit_file("a.txt", "1", "base");
+    repo.git(&["checkout", "--quiet", "-b", "feature"]);
+    repo.commit_file("f1.txt", "f", "feature one");
+    repo.commit_file("f2.txt", "f", "feature two");
+    repo.git(&["checkout", "--quiet", "main"]);
+    repo.commit_file("m1.txt", "m", "main one");
+    repo.git(&["merge", "--quiet", "--no-ff", "-m", "merge", "feature"]);
+
+    // The invariant every one of git's orderings guarantees, and the one the graph renderer
+    // depends on to lay out its lanes.
+    for ordering in [
+        CommitOrdering::Date,
+        CommitOrdering::AuthorDate,
+        CommitOrdering::Topo,
+    ] {
+        let hashes = walk_all(&repo, 100, ordering);
+        let position: std::collections::HashMap<&str, usize> = hashes
+            .iter()
+            .enumerate()
+            .map(|(index, hash)| (hash.as_str(), index))
+            .collect();
+
+        let engine = open(&repo);
+        let git = engine.borrow();
+        for hash in &hashes {
+            let id = gix::ObjectId::from_hex(hash.as_bytes()).unwrap();
+            let commit = git.find_commit(id).unwrap();
+            for parent in commit.parent_ids() {
+                let parent = parent.detach().to_string();
+                if let Some(&parent_index) = position.get(parent.as_str()) {
+                    assert!(
+                        parent_index > position[hash.as_str()],
+                        "{ordering:?}: parent {parent} was shown before its child {hash}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn limits_the_page_to_the_requested_size() {
+    require_git!();
+    let mut repo = TestRepo::new();
+    for index in 0..20 {
+        repo.commit_file("a.txt", &index.to_string(), &format!("commit {index}"));
+    }
+
+    let hashes = walk_all(&repo, 5, CommitOrdering::Date);
+    assert_eq!(hashes.len(), 5);
+    assert_eq!(
+        hashes,
+        repo.log_hashes(&["--date-order", "--all", "--max-count=5"])
+    );
+}
+
+#[test]
+fn reads_the_commit_fields_the_graph_renders() {
+    require_git!();
+    let mut repo = TestRepo::new();
+    let hash = repo.commit_file("a.txt", "1", "the subject line\n\nthe body");
+
+    let engine = open(&repo);
+    let tips = log::all_tips(&engine, true, true).unwrap();
+    let records = log::walk(
+        &engine,
+        &tips,
+        &WalkOptions {
+            limit: 10,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(records.len(), 1);
+    let record = &records[0];
+    assert_eq!(record.hash, hash);
+    assert_eq!(record.author, "Test User");
+    assert_eq!(record.email, "test@example.com");
+    // The graph's message column shows the subject only, as `git log --format=%s` does.
+    assert_eq!(record.message, "the subject line");
+    assert!(record.parents.is_empty());
+    assert_eq!(
+        record.date.to_string(),
+        repo.git(&["log", "-1", "--format=%ct"]).trim()
+    );
+}
+
+#[test]
+fn filters_commits_by_author() {
+    require_git!();
+    let mut repo = TestRepo::new();
+    repo.commit_file("a.txt", "1", "by the default user");
+    repo.git(&["config", "user.name", "Other Person"]);
+    repo.git(&["config", "user.email", "other@example.com"]);
+    let other = repo.commit_file("b.txt", "2", "by the other user");
+
+    let engine = open(&repo);
+    let tips = log::all_tips(&engine, true, true).unwrap();
+    let options = WalkOptions {
+        limit: 100,
+        authors: Some(vec!["Other Person".to_string()]),
+        ..Default::default()
+    };
+    let records = log::walk(&engine, &tips, &options).unwrap();
+
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].hash, other);
+}
+
+#[test]
+fn filters_commits_by_path() {
+    require_git!();
+    let mut repo = TestRepo::new();
+    repo.commit_file("src/a.txt", "1", "touches src");
+    repo.commit_file("docs/b.txt", "2", "touches docs");
+    repo.commit_file("src/c.txt", "3", "touches src again");
+
+    let engine = open(&repo);
+    let tips = log::all_tips(&engine, true, true).expect("could not resolve the tips");
+    let options = WalkOptions {
+        limit: 100,
+        filter_paths: vec!["src".to_string()],
+        ..Default::default()
+    };
+    let records = log::walk(&engine, &tips, &options).unwrap();
+    let hashes: Vec<String> = records.iter().map(|record| record.hash.clone()).collect();
+
+    assert_eq!(
+        hashes,
+        repo.log_hashes(&["--format=%H", "--all", "--", "src"])
+    );
+}
+
+#[test]
+fn filters_commits_by_a_single_file_path() {
+    require_git!();
+    let mut repo = TestRepo::new();
+    repo.commit_file("src/keep.txt", "1", "base");
+    let added = repo.commit_file("src/watched.txt", "1", "add the watched file");
+    // A sibling changing must not read as the watched file changing, even though both commits
+    // rewrite the same directory tree.
+    repo.commit_file("src/keep.txt", "2", "touch only the sibling");
+    repo.remove("src/watched.txt");
+    let removed = repo.commit("remove the watched file");
+
+    let engine = open(&repo);
+    let tips = log::all_tips(&engine, true, true).unwrap();
+    let options = WalkOptions {
+        limit: 100,
+        filter_paths: vec!["src/watched.txt".to_string()],
+        ..Default::default()
+    };
+    let records = log::walk(&engine, &tips, &options).unwrap();
+    let hashes: Vec<String> = records.iter().map(|record| record.hash.clone()).collect();
+
+    assert_eq!(
+        hashes,
+        repo.log_hashes(&["--format=%H", "--all", "--", "src/watched.txt"])
+    );
+    assert_eq!(hashes, vec![removed, added]);
+}
+
+#[test]
+fn filters_commits_by_several_paths_at_once() {
+    require_git!();
+    let mut repo = TestRepo::new();
+    let first = repo.commit_file("src/a.txt", "1", "base");
+    let second = repo.commit_file("docs/b.txt", "2", "docs");
+    repo.commit_file("src/c.txt", "3", "src");
+    repo.commit_file("other/d.txt", "4", "neither of the filtered paths");
+
+    let engine = open(&repo);
+    let tips = log::all_tips(&engine, true, true).unwrap();
+    let options = WalkOptions {
+        limit: 100,
+        filter_paths: vec!["src/a.txt".to_string(), "docs/b.txt".to_string()],
+        ..Default::default()
+    };
+    let records = log::walk(&engine, &tips, &options).unwrap();
+    let hashes: Vec<String> = records.iter().map(|record| record.hash.clone()).collect();
+
+    assert_eq!(
+        hashes,
+        repo.log_hashes(&["--format=%H", "--all", "--", "src/a.txt", "docs/b.txt"])
+    );
+    assert_eq!(hashes, vec![second, first]);
+}
+
+#[test]
+fn a_mode_change_counts_as_a_change_to_the_file() {
+    require_git!();
+    let mut repo = TestRepo::new();
+    repo.commit_file("run.sh", "1", "base");
+    // The filesystem cannot carry the bit everywhere, so the index is told directly — the mode is
+    // part of a tree entry, and a commit that only flips it is in the file's history.
+    repo.git(&["config", "core.filemode", "false"]);
+    repo.git(&["update-index", "--chmod=+x", "run.sh"]);
+    let flipped = repo.commit("make the file executable");
+
+    let engine = open(&repo);
+    let tips = log::all_tips(&engine, true, true).unwrap();
+    let options = WalkOptions {
+        limit: 100,
+        filter_paths: vec!["run.sh".to_string()],
+        ..Default::default()
+    };
+    let records = log::walk(&engine, &tips, &options).unwrap();
+    let hashes: Vec<String> = records.iter().map(|record| record.hash.clone()).collect();
+
+    assert_eq!(
+        hashes,
+        repo.log_hashes(&["--format=%H", "--all", "--", "run.sh"])
+    );
+    assert!(hashes.contains(&flipped));
+}
+
+#[test]
+fn a_merge_carrying_a_branchs_changes_in_stays_out_of_the_filtered_log() {
+    require_git!();
+    let mut repo = TestRepo::new();
+    let base = repo.commit_file("src/a.txt", "1", "base");
+    repo.git(&["checkout", "--quiet", "-b", "feature"]);
+    let feature = repo.commit_file("src/feature.txt", "f", "feature work");
+    repo.git(&["checkout", "--quiet", "main"]);
+    let main = repo.commit_file("docs/main.txt", "m", "main work");
+    repo.git(&[
+        "merge",
+        "--quiet",
+        "--no-ff",
+        "-m",
+        "merge feature",
+        "feature",
+    ]);
+
+    let engine = open(&repo);
+    let tips = log::all_tips(&engine, true, true).unwrap();
+
+    // The merge is treesame to the feature side for src, and to the main side for docs, so neither
+    // filtered log shows it — matching `git log -- <path>`, which simplifies it away.
+    for (path, expected) in [("src", vec![feature, base.clone()]), ("docs", vec![main])] {
+        let options = WalkOptions {
+            limit: 100,
+            filter_paths: vec![path.to_string()],
+            ..Default::default()
+        };
+        let records = log::walk(&engine, &tips, &options).unwrap();
+        let hashes: Vec<String> = records.iter().map(|record| record.hash.clone()).collect();
+        assert_eq!(hashes, expected, "filtering by {path}");
+        assert_eq!(
+            hashes,
+            repo.log_hashes(&["--format=%H", "--all", "--", path]),
+            "git disagrees about filtering by {path}"
+        );
+    }
+}
+
+#[test]
+fn keeps_reparenting_when_the_author_filter_hides_the_commits_between() {
+    require_git!();
+    let mut repo = TestRepo::new();
+    let base = repo.commit_file("src/a.txt", "1", "by the default user");
+    repo.git(&["config", "user.name", "Other Person"]);
+    repo.git(&["config", "user.email", "other@example.com"]);
+    repo.commit_file("docs/b.txt", "2", "by the other user");
+    repo.git(&["config", "user.name", "Test User"]);
+    repo.git(&["config", "user.email", "test@example.com"]);
+    let top = repo.commit_file("src/c.txt", "3", "by the default user again");
+
+    let engine = open(&repo);
+    let tips = log::all_tips(&engine, true, true).unwrap();
+    let options = WalkOptions {
+        limit: 100,
+        authors: Some(vec!["Test User".to_string()]),
+        filter_paths: vec!["src".to_string()],
+        ..Default::default()
+    };
+    let records = log::walk(&engine, &tips, &options).unwrap();
+    let hashes: Vec<String> = records.iter().map(|record| record.hash.clone()).collect();
+
+    // The other user's commit was read by the walk even though both filters hid it — that is what
+    // lets the src commit above it find its nearest shown ancestor, the base commit.
+    assert_eq!(hashes, vec![top, base.clone()]);
+    assert_eq!(records[0].parents, vec![base]);
+}
+
+#[test]
+fn keeps_the_graph_connected_when_filtering_by_path() {
+    require_git!();
+    let mut repo = TestRepo::new();
+    let first = repo.commit_file("src/a.txt", "1", "touches src");
+    repo.commit_file("docs/b.txt", "2", "touches docs only");
+    let third = repo.commit_file("src/c.txt", "3", "touches src again");
+
+    let engine = open(&repo);
+    let tips = log::all_tips(&engine, true, true).unwrap();
+    let options = WalkOptions {
+        limit: 100,
+        filter_paths: vec!["src".to_string()],
+        ..Default::default()
+    };
+    let records = log::walk(&engine, &tips, &options).unwrap();
+
+    // The docs-only commit is hidden, so the src commit above it must be re-parented onto the src
+    // commit below it — otherwise the graph would render as two disconnected fragments.
+    let newest = records
+        .iter()
+        .find(|record| record.hash == third)
+        .expect("the newest commit");
+    assert_eq!(
+        newest.parents,
+        vec![first],
+        "the hidden commit was not simplified away"
+    );
+}
+
+#[test]
+fn reads_branches_tags_and_head() {
+    require_git!();
+    let mut repo = TestRepo::new();
+    let first = repo.commit_file("a.txt", "1", "first");
+    repo.git(&["tag", "v1.0"]);
+    repo.git(&["checkout", "--quiet", "-b", "feature"]);
+    let second = repo.commit_file("b.txt", "2", "second");
+    repo.git(&["tag", "-a", "v2.0", "-m", "annotated"]);
+
+    let engine = open(&repo);
+    let snapshot = read_refs(&engine, &RefReadOptions::default()).unwrap();
+
+    assert_eq!(snapshot.ref_data.head.as_deref(), Some(second.as_str()));
+    assert_eq!(snapshot.branch_head.as_deref(), Some("feature"));
+    // The checked-out branch is listed first, as `git branch` lists it.
+    assert_eq!(snapshot.branches, vec!["feature", "main"]);
+    assert_eq!(snapshot.tag_names, vec!["v1.0", "v2.0"]);
+
+    let heads: Vec<(&str, &str)> = snapshot
+        .ref_data
+        .heads
+        .iter()
+        .map(|head| (head.name.as_str(), head.hash.as_str()))
+        .collect();
+    assert!(heads.contains(&("main", first.as_str())));
+    assert!(heads.contains(&("feature", second.as_str())));
+
+    // A lightweight tag points straight at its commit; an annotated one only reaches its commit
+    // through the peeled record, which is what carries the label in the graph.
+    let lightweight = snapshot
+        .ref_data
+        .tags
+        .iter()
+        .find(|tag| tag.name == "v1.0")
+        .unwrap();
+    assert_eq!(lightweight.hash, first);
+    assert!(!lightweight.annotated);
+
+    let peeled = snapshot
+        .ref_data
+        .tags
+        .iter()
+        .find(|tag| tag.name == "v2.0" && tag.annotated)
+        .expect("the annotated tag was not peeled");
+    assert_eq!(peeled.hash, second);
+}
+
+#[test]
+fn reads_remote_tracking_branches_and_honours_the_view_options() {
+    require_git!();
+    let mut repo = TestRepo::new();
+    let head = repo.commit_file("a.txt", "1", "first");
+    repo.add_fake_remote("origin", "main", &head);
+    repo.update_ref("refs/remotes/origin/HEAD", &head);
+    repo.update_ref("refs/remotes/upstream/main", &head);
+
+    let engine = open(&repo);
+
+    // Remote branches hidden entirely.
+    let snapshot = read_refs(&engine, &RefReadOptions::default()).unwrap();
+    assert!(snapshot.ref_data.remotes.is_empty());
+
+    // Remote branches shown, remote HEADs hidden (the default).
+    let options = RefReadOptions {
+        show_remote_branches: true,
+        ..Default::default()
+    };
+    let snapshot = read_refs(&engine, &options).unwrap();
+    let names: Vec<&str> = snapshot
+        .ref_data
+        .remotes
+        .iter()
+        .map(|r| r.name.as_str())
+        .collect();
+    assert!(names.contains(&"origin/main"));
+    assert!(names.contains(&"upstream/main"));
+    assert!(
+        !names.contains(&"origin/HEAD"),
+        "remote HEADs should be hidden by default"
+    );
+    assert!(snapshot
+        .branches
+        .contains(&"remotes/origin/main".to_string()));
+
+    // A hidden remote drops out completely.
+    let options = RefReadOptions {
+        show_remote_branches: true,
+        hide_remotes: vec!["upstream".to_string()],
+        ..Default::default()
+    };
+    let snapshot = read_refs(&engine, &options).unwrap();
+    let names: Vec<&str> = snapshot
+        .ref_data
+        .remotes
+        .iter()
+        .map(|r| r.name.as_str())
+        .collect();
+    assert!(names.contains(&"origin/main"));
+    assert!(!names.contains(&"upstream/main"));
+}
+
+#[test]
+fn shows_gerrit_change_refs_only_when_asked() {
+    require_git!();
+    let mut repo = TestRepo::new();
+    let head = repo.commit_file("a.txt", "1", "first");
+    repo.add_fake_remote("origin", "main", &head);
+    repo.update_ref("refs/remotes/origin/changes/45/12345/1", &head);
+    repo.update_ref("refs/remotes/origin/changes/45/12345/meta", &head);
+
+    let engine = open(&repo);
+
+    // A Gerrit repository can hold tens of thousands of change refs, so they stay out of the
+    // graph — and out of the Branches dropdown — unless "Show Refs" is on.
+    let options = RefReadOptions {
+        show_remote_branches: true,
+        ..Default::default()
+    };
+    let snapshot = read_refs(&engine, &options).unwrap();
+    assert!(snapshot
+        .ref_data
+        .remotes
+        .iter()
+        .all(|r| !r.name.contains("changes/")));
+
+    let options = RefReadOptions {
+        show_remote_branches: true,
+        show_change_refs: true,
+        ..Default::default()
+    };
+    let snapshot = read_refs(&engine, &options).unwrap();
+    let names: Vec<&str> = snapshot
+        .ref_data
+        .remotes
+        .iter()
+        .map(|r| r.name.as_str())
+        .collect();
+    assert!(names.contains(&"origin/changes/45/12345/1"));
+    // The NoteDb meta refs are never displayed.
+    assert!(!names.iter().any(|name| name.ends_with("/meta")));
+    // Change refs are never offered as branches, however they are displayed.
+    assert!(snapshot
+        .branches
+        .iter()
+        .all(|branch| !branch.contains("changes/")));
+}
+
+#[test]
+fn an_empty_repository_reports_no_head_rather_than_failing() {
+    require_git!();
+    let repo = TestRepo::new();
+    let engine = open(&repo);
+
+    let snapshot = read_refs(&engine, &RefReadOptions::default()).unwrap();
+    assert_eq!(snapshot.ref_data.head, None);
+    // The unborn branch has no ref, but its name is still listed — as the CLI backend and
+    // `git status` report it — so the view names the branch the first commit will land on.
+    assert_eq!(snapshot.branches, vec!["main"]);
+}
+
+#[test]
+fn an_empty_author_list_filters_nothing() {
+    require_git!();
+    let mut repo = TestRepo::new();
+    repo.commit_file("a.txt", "1", "first");
+    repo.commit_file("b.txt", "2", "second");
+
+    // `git log` with no `--author` shows every commit; the CLI backend treats an empty author
+    // list the same way, so the engine must not read it as "match nobody".
+    let engine = open(&repo);
+    let tips = log::all_tips(&engine, true, true).unwrap();
+    let options = WalkOptions {
+        limit: 100,
+        authors: Some(Vec::new()),
+        ..Default::default()
+    };
+    let hashes: Vec<String> = log::walk(&engine, &tips, &options)
+        .unwrap()
+        .into_iter()
+        .map(|record| record.hash)
+        .collect();
+    assert_eq!(hashes, repo.log_hashes(&["--date-order", "--all"]));
+}
+
+#[test]
+fn an_empty_filter_path_filters_nothing() {
+    require_git!();
+    let mut repo = TestRepo::new();
+    repo.commit_file("a.txt", "1", "first");
+    // An empty commit changes no path, so any path filter at all would drop it.
+    repo.git(&["commit", "--quiet", "--allow-empty", "-m", "empty"]);
+    repo.commit_file("b.txt", "2", "third");
+
+    // The CLI backend drops empty paths before building `-- <paths>`; with nothing left there is
+    // no filter, and the empty commit is shown.
+    let engine = open(&repo);
+    let tips = log::all_tips(&engine, true, true).unwrap();
+    let options = WalkOptions {
+        limit: 100,
+        filter_paths: vec![String::new()],
+        ..Default::default()
+    };
+    let hashes: Vec<String> = log::walk(&engine, &tips, &options)
+        .unwrap()
+        .into_iter()
+        .map(|record| record.hash)
+        .collect();
+    assert_eq!(hashes, repo.log_hashes(&["--date-order", "--all"]));
+}
+
+#[test]
+fn topological_order_matches_git_with_and_without_a_path_filter() {
+    require_git!();
+    let mut repo = TestRepo::new();
+    repo.commit_file("src/base.txt", "0", "base");
+    repo.git(&["checkout", "--quiet", "-b", "side"]);
+    repo.commit_file("src/side1.txt", "1", "side 1");
+    repo.git(&["checkout", "--quiet", "main"]);
+    repo.commit_file("src/main1.txt", "1", "main 1");
+    repo.git(&["checkout", "--quiet", "side"]);
+    repo.commit_file("src/side2.txt", "2", "side 2");
+    repo.git(&["checkout", "--quiet", "main"]);
+    repo.commit_file("src/main2.txt", "2", "main 2");
+
+    let engine = open(&repo);
+    let tips = log::all_tips(&engine, true, true).unwrap();
+    let walk = |filter_paths: Vec<String>| -> Vec<String> {
+        let options = WalkOptions {
+            limit: 100,
+            ordering: CommitOrdering::Topo,
+            filter_paths,
+            ..Default::default()
+        };
+        log::walk(&engine, &tips, &options)
+            .unwrap()
+            .into_iter()
+            .map(|record| record.hash)
+            .collect()
+    };
+
+    // git reverses its initially-ready commits so that the newest tip comes out first, then keeps
+    // following the line it is on: main 2, main 1, side 2, side 1, base.
+    assert_eq!(
+        walk(Vec::new()),
+        repo.log_hashes(&["--topo-order", "--all"])
+    );
+    // A path-filtered page is ordered the same way, not left in the walk's commit-time order.
+    assert_eq!(
+        walk(vec!["src".to_string()]),
+        repo.log_hashes(&[
+            "--topo-order",
+            "--full-history",
+            "--simplify-merges",
+            "--all",
+            "--",
+            "src",
+        ])
+    );
+}
+
+#[test]
+fn topological_order_matches_git_across_merges() {
+    require_git!();
+    let mut repo = TestRepo::new();
+    repo.commit_file("base.txt", "0", "base");
+    for round in 1..=3 {
+        repo.git(&["checkout", "--quiet", "-b", &format!("topic{round}")]);
+        repo.commit_file(
+            &format!("topic{round}a.txt"),
+            "a",
+            &format!("topic {round} a"),
+        );
+        repo.git(&["checkout", "--quiet", "main"]);
+        repo.commit_file(&format!("main{round}.txt"), "m", &format!("main {round}"));
+        repo.git(&["checkout", "--quiet", &format!("topic{round}")]);
+        repo.commit_file(
+            &format!("topic{round}b.txt"),
+            "b",
+            &format!("topic {round} b"),
+        );
+        repo.git(&["checkout", "--quiet", "main"]);
+        repo.git(&[
+            "merge",
+            "--quiet",
+            "--no-ff",
+            "-m",
+            &format!("merge {round}"),
+            &format!("topic{round}"),
+        ]);
+    }
+    // One unmerged branch as a second tip.
+    repo.git(&["checkout", "--quiet", "-b", "loose", "HEAD~1"]);
+    repo.commit_file("loose.txt", "l", "loose");
+    repo.git(&["checkout", "--quiet", "main"]);
+
+    assert_eq!(
+        walk_all(&repo, 100, CommitOrdering::Topo),
+        repo.log_hashes(&["--topo-order", "--all"])
+    );
+}
+
+#[test]
+fn a_remote_branch_with_tags_in_its_path_stays_a_branch() {
+    require_git!();
+    let mut repo = TestRepo::new();
+    let head = repo.commit_file("a.txt", "1", "first");
+    repo.add_fake_remote("origin", "feature/tags/cleanup", &head);
+    // The layout a `+refs/tags/*:refs/remotes/origin/tags/*` refspec writes: a real remote tag.
+    repo.update_ref("refs/remotes/origin/tags/v1", &head);
+
+    let engine = open(&repo);
+    let options = RefReadOptions {
+        show_remote_branches: true,
+        ..Default::default()
+    };
+    let snapshot = read_refs(&engine, &options).unwrap();
+    let remotes: Vec<&str> = snapshot
+        .ref_data
+        .remotes
+        .iter()
+        .map(|r| r.name.as_str())
+        .collect();
+    let tags: Vec<&str> = snapshot
+        .ref_data
+        .tags
+        .iter()
+        .map(|t| t.name.as_str())
+        .collect();
+    assert!(
+        remotes.contains(&"origin/feature/tags/cleanup"),
+        "a branch whose name contains `tags/` is still a branch: {remotes:?}"
+    );
+    assert!(snapshot
+        .branches
+        .contains(&"remotes/origin/feature/tags/cleanup".to_string()));
+    assert!(
+        !tags.contains(&"origin/feature/cleanup"),
+        "the branch must not be mistaken for a tag: {tags:?}"
+    );
+    // The genuine remote tag directly below the remote is still read as one.
+    assert!(tags.contains(&"origin/v1"), "{tags:?}");
+    assert!(!remotes.contains(&"origin/tags/v1"));
+}
+
+/// One commit of a `fast-import` stream: a mark, the two dates the scenario needs to diverge
+/// (author and committer are set independently — exactly the rebase/import shape the author-date
+/// window exists for), and the parent (`from`, which fast-import reads AFTER the message).
+fn import_commit(
+    mark: usize,
+    parent: Option<usize>,
+    author: i64,
+    committer: i64,
+    message: &str,
+) -> String {
+    let mut out = format!("commit refs/heads/main\nmark :{mark}\n");
+    out.push_str(&format!(
+        "author Test User <test@example.com> {author} +0000\ncommitter Test User <test@example.com> {committer} +0000\ndata {}\n{message}\n",
+        message.len() + 1
+    ));
+    if let Some(parent) = parent {
+        out.push_str(&format!("from :{parent}\n"));
+    }
+    out
+}
+
+#[test]
+fn the_author_date_window_keeps_the_commits_author_date_order_surfaces() {
+    require_git!();
+    let repo = TestRepo::new();
+
+    // A history longer than the walk's window floor (256), where one out-of-band commit has the
+    // NEWEST author date but an OLD committer date: a committer-date window cut (gix's traversal
+    // ranking) drops it exactly when the author-date page should show it first.
+    let total = 300;
+    let base = 1_600_000_000;
+    let mut stream = import_commit(1, None, base, base, "c1");
+    for index in 2..=total {
+        let tick = base + (index as i64) * 60;
+        stream.push_str(&import_commit(
+            index,
+            Some(index - 1),
+            tick,
+            tick,
+            &format!("c{index}"),
+        ));
+    }
+    // The out-of-band commit: a second branch off the OLDEST commit, authored "now" (the newest
+    // author date of the whole repository) but committed back then (among the oldest committer
+    // dates — outside the newest-256-by-committer-date window).
+    stream.push_str(&format!(
+        "commit refs/heads/out-of-band\nmark :{}\nauthor Test User <test@example.com> {} +0000\ncommitter Test User <test@example.com> {} +0000\ndata 12\nout-of-band\nfrom :1\n",
+        total + 1,
+        base + 86_400,
+        base + 60
+    ));
+    repo.git_with_stdin(&["fast-import", "--quiet"], &stream);
+
+    // The reference answer: git's own `--author-date-order` page has the out-of-band commit
+    // first (its author date is the newest), then the newest-authored commits of main.
+    let expected = repo.log_hashes(&["--author-date-order", "--all", "-n", "10"]);
+    assert_eq!(expected.len(), 10);
+    assert_eq!(
+        expected[0],
+        repo.rev_parse("refs/heads/out-of-band"),
+        "git puts the newest-authored commit first under --author-date-order"
+    );
+
+    let engine = open(&repo);
+    let tips = log::all_tips(&engine, true, true).expect("could not resolve the tips");
+    let options = WalkOptions {
+        limit: 10,
+        ordering: CommitOrdering::AuthorDate,
+        ..Default::default()
+    };
+    let hashes: Vec<String> = log::walk(&engine, &tips, &options)
+        .expect("the walk failed")
+        .into_iter()
+        .map(|record| record.hash)
+        .collect();
+
+    assert_eq!(
+        hashes, expected,
+        "the author-date window must rank by the ordering in effect, not by committer date"
+    );
+
+    // The control: under date order the same commit stays off the page (its committer date is
+    // old), and the page still matches git.
+    let expected_date = repo.log_hashes(&["--date-order", "--all", "-n", "10"]);
+    let options = WalkOptions {
+        limit: 10,
+        ordering: CommitOrdering::Date,
+        ..Default::default()
+    };
+    let hashes: Vec<String> = log::walk(&engine, &tips, &options)
+        .expect("the walk failed")
+        .into_iter()
+        .map(|record| record.hash)
+        .collect();
+    assert_eq!(hashes, expected_date);
+    assert!(!hashes.contains(&repo.rev_parse("refs/heads/out-of-band")));
+}

@@ -1,0 +1,345 @@
+//! Configuration reads, file contents at a revision, and single-file diffs.
+
+#[macro_use]
+mod common;
+
+use git_graph_core::repository::Repo;
+use git_graph_core::{blob, config};
+
+use common::TestRepo;
+
+fn open(repo: &TestRepo) -> Repo {
+    Repo::discover(repo.path()).expect("could not open the fixture repository")
+}
+
+#[test]
+fn reads_the_identity_remotes_and_diff_tools() {
+    require_git!();
+    let mut repo = TestRepo::new();
+    repo.commit_file("a.txt", "1\n", "first");
+    repo.git(&["remote", "add", "origin", "https://example.invalid/one.git"]);
+    repo.git(&[
+        "remote",
+        "add",
+        "upstream",
+        "https://example.invalid/two.git",
+    ]);
+    repo.git(&[
+        "config",
+        "remote.origin.pushurl",
+        "git@example.invalid:one.git",
+    ]);
+    repo.git(&["config", "remote.pushdefault", "origin"]);
+    repo.git(&["config", "diff.tool", "vscode"]);
+
+    let engine = open(&repo);
+    let snapshot = config::read_config(&engine).unwrap();
+
+    assert_eq!(snapshot.user_name.as_deref(), Some("Test User"));
+    assert_eq!(snapshot.user_email.as_deref(), Some("test@example.com"));
+    assert_eq!(snapshot.push_default.as_deref(), Some("origin"));
+    assert_eq!(snapshot.diff_tool.as_deref(), Some("vscode"));
+    assert_eq!(snapshot.diff_gui_tool, None);
+
+    // Remotes keep the order the config files declare them in.
+    assert_eq!(snapshot.remotes.len(), 2);
+    assert_eq!(snapshot.remotes[0].name, "origin");
+    assert_eq!(
+        snapshot.remotes[0].url.as_deref(),
+        Some("https://example.invalid/one.git")
+    );
+    assert_eq!(
+        snapshot.remotes[0].push_url.as_deref(),
+        Some("git@example.invalid:one.git")
+    );
+    assert_eq!(snapshot.remotes[1].name, "upstream");
+    assert_eq!(snapshot.remotes[1].push_url, None);
+}
+
+#[test]
+fn reports_absent_configuration_as_none() {
+    require_git!();
+    let repo = TestRepo::new();
+    // The fixture's own identity lives in the local config; undo it so nothing is set.
+    repo.git(&["config", "--unset", "user.name"]);
+    repo.git(&["config", "--unset", "user.email"]);
+
+    // The machine running the test may have its own global and system configs; the engine must
+    // see none of them for "absent" to be observable. Environment variables are process-wide, so
+    // the override is taken under a lock and restored before returning.
+    let _guard = ENV_LOCK.lock().unwrap();
+    std::env::set_var("GIT_CONFIG_GLOBAL", repo.path().join("no-such-gitconfig"));
+    std::env::set_var("GIT_CONFIG_NOSYSTEM", "1");
+
+    let engine = open(&repo);
+    let snapshot = config::read_config(&engine).unwrap();
+
+    std::env::remove_var("GIT_CONFIG_GLOBAL");
+    std::env::remove_var("GIT_CONFIG_NOSYSTEM");
+
+    assert_eq!(snapshot.user_name, None);
+    assert_eq!(snapshot.user_email, None);
+    assert_eq!(snapshot.push_default, None);
+    assert_eq!(snapshot.diff_tool, None);
+    assert_eq!(snapshot.diff_gui_tool, None);
+    assert!(snapshot.remotes.is_empty());
+}
+
+/// Serialises the tests that touch process-wide configuration environment variables.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+fn resolves_remote_fields_independently_across_config_files() {
+    require_git!();
+    let repo = TestRepo::new();
+    // The URL is local-only; the push URL for the very same remote exists only in a fake global
+    // config. Each field must be resolved through its own local-over-global precedence, not both
+    // taken from whichever config file's `[remote "origin"]` section is encountered first.
+    repo.git(&["remote", "add", "origin", "https://example.invalid/one.git"]);
+
+    let global_config = repo.path().join("fake-global-gitconfig");
+    std::fs::write(
+        &global_config,
+        "[remote \"origin\"]\n\tpushurl = git@example.invalid:global-push.git\n",
+    )
+    .unwrap();
+
+    let _guard = ENV_LOCK.lock().unwrap();
+    std::env::set_var("GIT_CONFIG_GLOBAL", &global_config);
+    std::env::set_var("GIT_CONFIG_NOSYSTEM", "1");
+
+    let engine = open(&repo);
+    let snapshot = config::read_config(&engine).unwrap();
+
+    std::env::remove_var("GIT_CONFIG_GLOBAL");
+    std::env::remove_var("GIT_CONFIG_NOSYSTEM");
+
+    assert_eq!(snapshot.remotes.len(), 1);
+    assert_eq!(
+        snapshot.remotes[0].url.as_deref(),
+        Some("https://example.invalid/one.git")
+    );
+    assert_eq!(
+        snapshot.remotes[0].push_url.as_deref(),
+        Some("git@example.invalid:global-push.git")
+    );
+}
+
+#[test]
+fn reads_a_text_file_at_a_revision() {
+    require_git!();
+    let mut repo = TestRepo::new();
+    repo.commit_file("a.txt", "one\ntwo\n", "first");
+    let hash = repo.commit_file("a.txt", "one\ntwo\nthree\n", "second");
+
+    let engine = open(&repo);
+    let file = blob::commit_file(&engine, &hash, "a.txt").unwrap();
+
+    assert!(!file.binary);
+    assert_eq!(file.contents.as_deref(), Some("one\ntwo\nthree\n"));
+}
+
+#[test]
+fn reports_a_binary_file_as_binary() {
+    require_git!();
+    let mut repo = TestRepo::new();
+    repo.write("blob.bin", "text\0with a nul\n");
+    let hash = repo.commit("add a binary file");
+
+    let engine = open(&repo);
+    let file = blob::commit_file(&engine, &hash, "blob.bin").unwrap();
+
+    assert!(file.binary);
+    assert_eq!(file.contents, None);
+}
+
+#[test]
+fn a_missing_path_is_not_found() {
+    require_git!();
+    let mut repo = TestRepo::new();
+    let hash = repo.commit_file("a.txt", "1\n", "first");
+
+    let engine = open(&repo);
+    let error = blob::commit_file(&engine, &hash, "no-such.txt").unwrap_err();
+
+    assert_eq!(error.kind, git_graph_core::ErrorKind::NotFound);
+}
+
+/// Unlike `commit_file`, the raw-byte read hands a binary blob's bytes back instead of
+/// discarding them - the hex/byte-level comparison views need the content precisely because
+/// it is not text.
+#[test]
+fn commit_file_bytes_returns_binary_content_verbatim() {
+    require_git!();
+    let mut repo = TestRepo::new();
+    repo.write("blob.bin", "text\0with a nul\n");
+    let hash = repo.commit("add a binary file");
+
+    let engine = open(&repo);
+    let bytes = blob::commit_file_bytes(&engine, &hash, "blob.bin").unwrap();
+
+    assert_eq!(bytes.as_deref(), Some("text\0with a nul\n".as_bytes()));
+}
+
+/// A path absent from the commit's tree reads as `None`, not an error: it is how the missing
+/// side of an added/deleted file materializes for the byte-level comparison views.
+#[test]
+fn commit_file_bytes_of_a_missing_path_is_none() {
+    require_git!();
+    let mut repo = TestRepo::new();
+    let hash = repo.commit_file("a.txt", "1\n", "first");
+
+    let engine = open(&repo);
+    let bytes = blob::commit_file_bytes(&engine, &hash, "no-such.bin").unwrap();
+
+    assert_eq!(bytes, None);
+}
+
+/// The staged copy's raw bytes, between "Modified" and "Staged" - the same content
+/// `index_file` reports as binary without handing back.
+#[test]
+fn index_file_bytes_reads_the_staged_binary_copy() {
+    require_git!();
+    let mut repo = TestRepo::new();
+    repo.commit_file("a.txt", "1\n", "first");
+    repo.write("staged.bin", "one\0two\n");
+    repo.git(&["add", "staged.bin"]);
+
+    let engine = open(&repo);
+    let bytes = blob::index_file_bytes(&engine, "staged.bin").unwrap();
+
+    assert_eq!(bytes.as_deref(), Some("one\0two\n".as_bytes()));
+    assert_eq!(
+        blob::index_file_bytes(&engine, "no-such.bin").unwrap(),
+        None
+    );
+}
+
+#[test]
+fn diffs_a_modified_file_against_its_parent() {
+    require_git!();
+    let mut repo = TestRepo::new();
+    repo.commit_file("a.txt", "one\ntwo\n", "first");
+    repo.commit_file("other.txt", "x\n", "untouched");
+    let hash = repo.commit_file("a.txt", "one\nthree\n", "third");
+
+    let engine = open(&repo);
+    let diff = blob::commit_file_diff(&engine, &hash, "a.txt").unwrap();
+
+    assert!(diff.contains("a.txt"));
+    assert!(diff.contains("-two"));
+    assert!(diff.contains("+three"));
+}
+
+#[test]
+fn diffs_a_file_added_by_a_root_commit() {
+    require_git!();
+    let mut repo = TestRepo::new();
+    let hash = repo.commit_file("a.txt", "one\n", "first");
+
+    let engine = open(&repo);
+    let diff = blob::commit_file_diff(&engine, &hash, "a.txt").unwrap();
+
+    assert!(diff.contains("a.txt"));
+    assert!(diff.contains("+one"));
+}
+
+#[test]
+fn diffs_a_renamed_file_across_the_rename() {
+    require_git!();
+    let mut repo = TestRepo::new();
+    let contents = (0..40).map(|n| format!("line {n}\n")).collect::<String>();
+    repo.commit_file("original.txt", &contents, "first");
+    repo.git(&["mv", "original.txt", "renamed.txt"]);
+    repo.write("renamed.txt", &contents);
+    let hash = repo.commit("rename it");
+
+    let engine = open(&repo);
+    let diff = blob::commit_file_diff(&engine, &hash, "renamed.txt").unwrap();
+
+    assert!(!diff.is_empty());
+    assert!(diff.contains("renamed.txt") || diff.contains("original.txt"));
+}
+
+#[test]
+fn an_untouched_file_diffs_to_nothing() {
+    require_git!();
+    let mut repo = TestRepo::new();
+    repo.commit_file("a.txt", "one\n", "first");
+    let hash = repo.commit_file("b.txt", "two\n", "second");
+
+    let engine = open(&repo);
+    let diff = blob::commit_file_diff(&engine, &hash, "a.txt").unwrap();
+
+    assert_eq!(diff, "");
+}
+
+#[test]
+fn a_deleted_file_diffs_against_the_empty_side() {
+    require_git!();
+    let mut repo = TestRepo::new();
+    repo.commit_file("a.txt", "one\n", "first");
+    repo.remove("a.txt");
+    let hash = repo.commit("remove it");
+
+    let engine = open(&repo);
+    let diff = blob::commit_file_diff(&engine, &hash, "a.txt").unwrap();
+
+    assert!(diff.contains("a.txt"));
+    assert!(diff.contains("-one"));
+    assert!(diff.contains("/dev/null"));
+}
+
+/// A sparse file of `len` bytes (zeroes): the cheap way to stand a file larger than the read cap
+/// on disk — `set_len` extends without writing, and the zero content compresses to nothing in
+/// the object database.
+fn sparse_file(repo: &TestRepo, path: &str, len: u64) {
+    use std::io::Write;
+    let full = repo.path().join(path);
+    let mut file = std::fs::File::create(&full).expect("could not create the file");
+    file.set_len(len).expect("could not extend the file");
+    file.flush().expect("could not flush the file extension");
+}
+
+#[test]
+fn a_blob_above_the_read_cap_is_refused_before_it_is_read() {
+    require_git!();
+    let mut repo = TestRepo::new();
+    sparse_file(&repo, "huge.bin", 101 * 1024 * 1024);
+    let hash = repo.commit("add a huge file");
+
+    let engine = open(&repo);
+    let error = blob::commit_file(&engine, &hash, "huge.bin").unwrap_err();
+
+    assert!(
+        error.to_string().contains("100 MiB"),
+        "the read must refuse above the cap, with the limit named: {error}"
+    );
+
+    // The raw-bytes channel (the hex comparison views) and the staged copy are capped by the
+    // same contract.
+    let error = blob::commit_file_bytes(&engine, &hash, "huge.bin").unwrap_err();
+    assert!(error.to_string().contains("100 MiB"), "{error}");
+}
+
+#[test]
+fn a_working_tree_file_above_the_read_cap_is_refused_before_it_is_read() {
+    require_git!();
+    let mut repo = TestRepo::new();
+    repo.commit_file("a.txt", "1", "first");
+    sparse_file(&repo, "huge.txt", 101 * 1024 * 1024);
+
+    let engine = open(&repo);
+    let error = blob::working_tree_file(&engine, "huge.txt").unwrap_err();
+
+    assert!(
+        error.to_string().contains("100 MiB"),
+        "the working-tree read must refuse above the cap, from the file's metadata: {error}"
+    );
+
+    // The same reader stays inside the working tree: a path that climbs out is refused rather
+    // than read, whatever it names on disk.
+    repo.write("outside.txt", "not part of the repository\n");
+    let error = blob::working_tree_file(&engine, "../outside.txt").unwrap_err();
+    assert!(error.to_string().contains("escapes"), "{error}");
+}

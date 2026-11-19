@@ -1,0 +1,31 @@
+[package]
+name = "git-graph-app"
+description = "Native macOS Git Graph desktop GUI built with GPUI and Ely-GPUI-Components"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+directories.workspace = true
+ely-core.workspace = true
+ely-git.workspace = true
+env_logger.workspace = true
+futures.workspace = true
+git-graph-core.workspace = true
+git-graph-layout.workspace = true
+git-graph-ops.workspace = true
+gpui.workspace = true
+gpui_platform.workspace = true
+jiff.workspace = true
+log.workspace = true
+notify.workspace = true
+rfd.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+similar.workspace = true
+
+[lints]
+workspace = true

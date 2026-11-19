@@ -7,17 +7,22 @@ use ely_core::buttons::{Button, ButtonVariant, SegmentedControl};
 use ely_core::feedback::Callout;
 use ely_core::forms::{Checkbox, Choice, Input, Select, TextInput};
 use ely_core::menus::{Menu, MenuItem};
+use ely_core::motion::{FAST, NUDGE, Shake, duration, ease_out_cubic};
 use ely_core::overlays::{ConfirmDialog, Dialog, PromptDialog};
 use ely_core::primitives::{IconName, Severity};
 use ely_core::theme::{ActiveTheme, ControlSize, TextSize};
 use git_graph_core::types::GitCommit;
 use git_graph_ops::{PushForceMode, PushOptions, ResetMode, SafetyWarning};
 use gpui::{
-    AnyElement, App, Entity, IntoElement, ParentElement, Pixels, Point, SharedString, Styled,
-    Window, div,
+    Animation, AnimationExt, AnyElement, App, Entity, IntoElement, ParentElement, Pixels, Point,
+    SharedString, Styled, Window, div,
 };
 
 use crate::app_view::GitGraphApp;
+use crate::motion_fx::{
+    next_shake_serial, validate_create_branch_name, validate_push_branch_inputs,
+    validate_rename_branch_name, validate_tag_name,
+};
 use crate::state::short_hash;
 
 /// 待执行的 Git 写操作（用于二次确认 / 安全警告确认后派发）。
@@ -74,17 +79,23 @@ pub enum ActiveModal {
         start_point: String,
         input: Entity<TextInput>,
         checkout: bool,
+        shake_serial: u64,
+        validation_error: Option<SharedString>,
     },
     RenameBranch {
         repo_path: PathBuf,
         old_name: String,
         input: Entity<TextInput>,
+        shake_serial: u64,
+        validation_error: Option<SharedString>,
     },
     CreateTag {
         repo_path: PathBuf,
         target: String,
         name_input: Entity<TextInput>,
         message_input: Entity<TextInput>,
+        shake_serial: u64,
+        validation_error: Option<SharedString>,
     },
     StashPush {
         repo_path: PathBuf,
@@ -102,6 +113,8 @@ pub enum ActiveModal {
         set_upstream: bool,
         push_tags: bool,
         force: PushForceMode,
+        shake_serial: u64,
+        validation_error: Option<SharedString>,
     },
     SafetyConfirm {
         warning: SafetyWarning,
@@ -115,6 +128,39 @@ pub enum ActiveModal {
         destructive: bool,
         pending: PendingWriteOp,
     },
+}
+
+impl ActiveModal {
+    /// 校验失败时递增 `shake_serial` 并记录提示文案，触发水平轻晃反馈。
+    pub fn trigger_validation_error(&mut self, msg: impl Into<SharedString>) -> Option<u64> {
+        let msg = msg.into();
+        match self {
+            Self::CreateBranch {
+                shake_serial,
+                validation_error,
+                ..
+            }
+            | Self::RenameBranch {
+                shake_serial,
+                validation_error,
+                ..
+            }
+            | Self::CreateTag {
+                shake_serial,
+                validation_error,
+                ..
+            }
+            | Self::PushBranch {
+                shake_serial,
+                validation_error,
+                ..
+            } => {
+                *validation_error = Some(msg);
+                Some(next_shake_serial(shake_serial))
+            }
+            _ => None,
+        }
+    }
 }
 
 /// 推送分支弹窗的默认表单参数。
@@ -853,6 +899,7 @@ fn format_start_point_label(start_point: &str) -> &str {
 /// 渲染当前激活的模态对话框。
 pub fn render_active_modal(
     modal: &ActiveModal,
+    modal_serial: u64,
     app_entity: gpui::WeakEntity<GitGraphApp>,
     cx: &App,
 ) -> AnyElement {
@@ -867,21 +914,44 @@ pub fn render_active_modal(
         }
     };
 
+    let entrance_wrap = |content: gpui::Div| -> AnyElement {
+        content
+            .with_animation(
+                ("modal-transition", modal_serial),
+                Animation::new(duration(FAST, cx)).with_easing(ease_out_cubic),
+                |el, t| el.opacity(t).pt(NUDGE * (1.0 - t)),
+            )
+            .into_any_element()
+    };
+
+    let error_banner = |err: Option<&SharedString>, cx: &App| -> Option<AnyElement> {
+        let theme = cx.theme();
+        err.map(|msg| {
+            div()
+                .text_size(theme.text_size(TextSize::Xs))
+                .text_color(theme.colors.danger)
+                .child(msg.clone())
+                .into_any_element()
+        })
+    };
+
     match modal {
         ActiveModal::CreateBranch {
             repo_path,
             start_point,
             input,
             checkout,
+            shake_serial,
+            validation_error,
         } => {
             let repo = repo_path.clone();
             let sp = start_point.clone();
             let do_checkout = *checkout;
             let theme = cx.theme();
             let name_val = input.read(cx).text().trim().to_string();
-            let valid = !name_val.is_empty()
-                && !name_val.contains(char::is_whitespace)
-                && !name_val.starts_with('-');
+            let shown_error = validation_error
+                .as_ref()
+                .filter(|_| validate_create_branch_name(&name_val).is_err());
 
             Dialog::new(
                 "create-branch-dialog",
@@ -889,23 +959,26 @@ pub fn render_active_modal(
                 close_fn,
             )
             .focus_first(input.read(cx).focus().clone())
-            .child(
+            .child(entrance_wrap(
                 div()
                     .flex()
                     .flex_col()
                     .gap_3()
                     .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_size(theme.text_size(TextSize::Sm))
-                                    .text_color(theme.colors.fg_muted)
-                                    .child("分支名称"),
-                            )
-                            .child(Input::new(input)),
+                        Shake::new("modal-input-shake", *shake_serial).child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_size(theme.text_size(TextSize::Sm))
+                                        .text_color(theme.colors.fg_muted)
+                                        .child("分支名称"),
+                                )
+                                .child(Input::new(input))
+                                .children(error_banner(shown_error, cx)),
+                        ),
                     )
                     .child(
                         Checkbox::new("create-branch-checkout", *checkout)
@@ -925,7 +998,7 @@ pub fn render_active_modal(
                                 }
                             }),
                     ),
-            )
+            ))
             .action(|close| {
                 Button::new("create-branch-cancel", "取消")
                     .variant(ButtonVariant::Ghost)
@@ -937,10 +1010,16 @@ pub fn render_active_modal(
                 move |close| {
                     Button::new("create-branch-submit", "创建分支")
                         .primary()
-                        .disabled(!valid)
                         .on_click(move |_, window, cx| {
                             let branch_name = input.read(cx).text().trim().to_string();
-                            if branch_name.is_empty() {
+                            if let Err(msg) = validate_create_branch_name(&branch_name) {
+                                app.update(cx, |this, cx| {
+                                    if let Some(m) = &mut this.modal {
+                                        m.trigger_validation_error(msg);
+                                        cx.notify();
+                                    }
+                                })
+                                .ok();
                                 return;
                             }
                             close(window, cx);
@@ -963,15 +1042,16 @@ pub fn render_active_modal(
             repo_path,
             old_name,
             input,
+            shake_serial,
+            validation_error,
         } => {
             let repo = repo_path.clone();
             let old = old_name.clone();
             let theme = cx.theme();
             let new_val = input.read(cx).text().trim().to_string();
-            let valid = !new_val.is_empty()
-                && new_val != *old_name
-                && !new_val.contains(char::is_whitespace)
-                && !new_val.starts_with('-');
+            let shown_error = validation_error
+                .as_ref()
+                .filter(|_| validate_rename_branch_name(old_name, &new_val).is_err());
 
             Dialog::new(
                 "rename-branch-dialog",
@@ -979,19 +1059,24 @@ pub fn render_active_modal(
                 close_fn,
             )
             .focus_first(input.read(cx).focus().clone())
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(
+            .child(entrance_wrap(
+                div().child(
+                    Shake::new("modal-input-shake", *shake_serial).child(
                         div()
-                            .text_size(theme.text_size(TextSize::Sm))
-                            .text_color(theme.colors.fg_muted)
-                            .child("新分支名称"),
-                    )
-                    .child(Input::new(input)),
-            )
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_size(theme.text_size(TextSize::Sm))
+                                    .text_color(theme.colors.fg_muted)
+                                    .child("新分支名称"),
+                            )
+                            .child(Input::new(input))
+                            .children(error_banner(shown_error, cx)),
+                    ),
+                ),
+            ))
             .action(|close| {
                 Button::new("rename-branch-cancel", "取消")
                     .variant(ButtonVariant::Ghost)
@@ -1003,10 +1088,16 @@ pub fn render_active_modal(
                 move |close| {
                     Button::new("rename-branch-submit", "重命名")
                         .primary()
-                        .disabled(!valid)
                         .on_click(move |_, window, cx| {
                             let next_name = input.read(cx).text().trim().to_string();
-                            if next_name.is_empty() || next_name == old {
+                            if let Err(msg) = validate_rename_branch_name(&old, &next_name) {
+                                app.update(cx, |this, cx| {
+                                    if let Some(m) = &mut this.modal {
+                                        m.trigger_validation_error(msg);
+                                        cx.notify();
+                                    }
+                                })
+                                .ok();
                                 return;
                             }
                             close(window, cx);
@@ -1024,12 +1115,16 @@ pub fn render_active_modal(
             target,
             name_input,
             message_input,
+            shake_serial,
+            validation_error,
         } => {
             let repo = repo_path.clone();
             let tgt = target.clone();
             let theme = cx.theme();
             let tag_name = name_input.read(cx).text().trim().to_string();
-            let valid = !tag_name.is_empty() && !tag_name.contains(' ') && !tag_name.starts_with('-');
+            let shown_error = validation_error
+                .as_ref()
+                .filter(|_| validate_tag_name(&tag_name).is_err());
 
             Dialog::new(
                 "create-tag-dialog",
@@ -1037,23 +1132,26 @@ pub fn render_active_modal(
                 close_fn,
             )
             .focus_first(name_input.read(cx).focus().clone())
-            .child(
+            .child(entrance_wrap(
                 div()
                     .flex()
                     .flex_col()
                     .gap_3()
                     .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_size(theme.text_size(TextSize::Sm))
-                                    .text_color(theme.colors.fg_muted)
-                                    .child("标签名（如 v1.2.0）"),
-                            )
-                            .child(Input::new(name_input)),
+                        Shake::new("modal-input-shake", *shake_serial).child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_size(theme.text_size(TextSize::Sm))
+                                        .text_color(theme.colors.fg_muted)
+                                        .child("标签名（如 v1.2.0）"),
+                                )
+                                .child(Input::new(name_input))
+                                .children(error_banner(shown_error, cx)),
+                        ),
                     )
                     .child(
                         div()
@@ -1068,7 +1166,7 @@ pub fn render_active_modal(
                             )
                             .child(Input::new(message_input)),
                     ),
-            )
+            ))
             .action(|close| {
                 Button::new("create-tag-cancel", "取消")
                     .variant(ButtonVariant::Ghost)
@@ -1081,11 +1179,17 @@ pub fn render_active_modal(
                 move |close| {
                     Button::new("create-tag-submit", "创建标签")
                         .primary()
-                        .disabled(!valid)
                         .on_click(move |_, window, cx| {
                             let name = name_input.read(cx).text().trim().to_string();
                             let msg = msg_input.read(cx).text().trim().to_string();
-                            if name.is_empty() {
+                            if let Err(err_msg) = validate_tag_name(&name) {
+                                app.update(cx, |this, cx| {
+                                    if let Some(m) = &mut this.modal {
+                                        m.trigger_validation_error(err_msg);
+                                        cx.notify();
+                                    }
+                                })
+                                .ok();
                                 return;
                             }
                             let message = (!msg.is_empty()).then_some(msg);
@@ -1138,15 +1242,16 @@ pub fn render_active_modal(
             set_upstream,
             push_tags,
             force,
+            shake_serial,
+            validation_error,
         } => {
             let repo = repo_path.clone();
             let theme = cx.theme();
             let remote_branch_val = remote_branch_input.read(cx).text().trim().to_string();
-            let branch_valid = !selected_branch.is_empty()
-                && !selected_remote.is_empty()
-                && !remote_branch_val.is_empty()
-                && !remote_branch_val.contains(char::is_whitespace)
-                && !remote_branch_val.starts_with('-');
+            let shown_error = validation_error.as_ref().filter(|_| {
+                validate_push_branch_inputs(selected_branch, selected_remote, &remote_branch_val)
+                    .is_err()
+            });
 
             let branch_choices: Vec<Choice> = if local_branches.is_empty() {
                 vec![Choice::new(selected_branch.clone(), selected_branch.clone())]
@@ -1285,7 +1390,7 @@ pub fn render_active_modal(
 
             Dialog::new("push-branch-dialog", "推送分支到远程", close_fn)
                 .focus_first(remote_branch_input.read(cx).focus().clone())
-                .child(
+                .child(entrance_wrap(
                     div()
                         .flex()
                         .flex_col()
@@ -1299,20 +1404,29 @@ pub fn render_active_modal(
                                 .child(branch_select),
                         )
                         .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap_1()
-                                .child(field_label("目标远端 (Remote)"))
-                                .child(remote_select),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap_1()
-                                .child(field_label("远程分支名"))
-                                .child(Input::new(remote_branch_input)),
+                            Shake::new("modal-input-shake", *shake_serial).child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_3()
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap_1()
+                                            .child(field_label("目标远端 (Remote)"))
+                                            .child(remote_select),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap_1()
+                                            .child(field_label("远程分支名"))
+                                            .child(Input::new(remote_branch_input)),
+                                    )
+                                    .children(error_banner(shown_error, cx)),
+                            ),
                         )
                         .child(
                             div()
@@ -1369,7 +1483,7 @@ pub fn render_active_modal(
                                 .child(force_control),
                         )
                         .children(warning_callout),
-                )
+                ))
                 .action(|close| {
                     Button::new("push-branch-cancel", "取消")
                         .variant(ButtonVariant::Ghost)
@@ -1379,20 +1493,28 @@ pub fn render_active_modal(
                     let app = app_entity.clone();
                     let remote_branch_input = remote_branch_input.clone();
                     move |close| {
-                        let btn = Button::new("push-branch-submit", "推送")
-                            .variant(if submit_force == PushForceMode::Force {
+                        let btn = Button::new("push-branch-submit", "推送").variant(
+                            if submit_force == PushForceMode::Force {
                                 ButtonVariant::Danger
                             } else {
                                 ButtonVariant::Primary
-                            })
-                            .disabled(!branch_valid);
+                            },
+                        );
                         btn.on_click(move |_, window, cx| {
                             let remote_branch =
                                 remote_branch_input.read(cx).text().trim().to_string();
-                            if submit_local.is_empty()
-                                || submit_remote.is_empty()
-                                || remote_branch.is_empty()
-                            {
+                            if let Err(err_msg) = validate_push_branch_inputs(
+                                &submit_local,
+                                &submit_remote,
+                                &remote_branch,
+                            ) {
+                                app.update(cx, |this, cx| {
+                                    if let Some(m) = &mut this.modal {
+                                        m.trigger_validation_error(err_msg);
+                                        cx.notify();
+                                    }
+                                })
+                                .ok();
                                 return;
                             }
                             let opts = PushOptions {

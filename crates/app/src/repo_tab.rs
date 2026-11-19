@@ -16,10 +16,18 @@ use git_graph_ops::{BranchSyncStatus, GitCli, RepoWatcher};
 use gpui::{Image, SharedString, Task, UniformListScrollHandle};
 
 use crate::diff_parser::{ParsedDiff, parse_unified_diff, stretches_from_texts};
+use crate::motion_fx::{PullRefreshState, RubberBandSpring};
 use crate::state::{
     FilterCriteria, commit_to_node, compute_graph_layout, filter_commit_indices,
     image_format_for_path, matches_author_filter, matches_commit_query, repo_display_name,
 };
+
+/// 写操作异步刷新后待定位高亮的目标提交。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingFlashTarget {
+    Head,
+    Hash(String),
+}
 
 /// 详情面板当前选中的文件所属分区。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,6 +131,23 @@ pub struct RepoTabState {
     pub graph_scroll: UniformListScrollHandle,
     /// 图形列水平滚动偏移（px，>= 0，整列共享以保持跨行泳道连线严格对齐）。
     pub graph_scroll_x: f32,
+    /// 图形列左右触边橡皮筋阻尼回弹模型。
+    pub graph_overscroll: RubberBandSpring,
+    /// 主提交列表底部触底阻尼回弹模型。
+    pub bottom_overscroll: RubberBandSpring,
+    /// 主提交列表顶部下拉刷新状态机。
+    pub pull_refresh: PullRefreshState,
+    /// 需要高亮闪动定位的提交 `(hash, flash_serial)`。
+    pub flash_commit: Option<(String, u64)>,
+    /// 单调递增的提交行闪动序列号。
+    pub flash_serial: u64,
+    /// 写操作完成后等待图谱软刷新就绪再高亮的目标提交。
+    pub pending_flash_target: Option<PendingFlashTarget>,
+    /// 底部状态栏同步成功轻闪序列号。
+    pub sync_flash_serial: u64,
+    pub _graph_overscroll_task: Option<Task<()>>,
+    pub _bottom_overscroll_task: Option<Task<()>>,
+    pub _pull_refresh_task: Option<Task<()>>,
     pub _watcher: Option<RepoWatcher>,
     pub _watch_task: Option<Task<()>>,
 }
@@ -173,8 +198,36 @@ impl RepoTabState {
             error: None,
             graph_scroll: UniformListScrollHandle::new(),
             graph_scroll_x: 0.0,
+            graph_overscroll: RubberBandSpring::new(RubberBandSpring::DEFAULT_MAX_PULL_PX),
+            bottom_overscroll: RubberBandSpring::new(20.0),
+            pull_refresh: PullRefreshState::new(),
+            flash_commit: None,
+            flash_serial: 0,
+            pending_flash_target: None,
+            sync_flash_serial: 0,
+            _graph_overscroll_task: None,
+            _bottom_overscroll_task: None,
+            _pull_refresh_task: None,
             _watcher: None,
             _watch_task: None,
+        }
+    }
+
+    /// 触发指定提交行的高亮定位闪动，返回本次分配的序列号。
+    pub fn trigger_commit_flash(&mut self, hash: impl Into<String>) -> u64 {
+        self.flash_serial = self.flash_serial.saturating_add(1);
+        self.flash_commit = Some((hash.into(), self.flash_serial));
+        self.flash_serial
+    }
+
+    /// 在下一帧递增同一提交的闪动序列号，确保首次滚动入场挂载的 `Flash` 也能可靠捕获变化并播放。
+    pub fn bump_commit_flash_key(&mut self, hash: &str, expected_serial: u64) -> bool {
+        if matches!(&self.flash_commit, Some((h, s)) if h == hash && *s == expected_serial) {
+            self.flash_serial = self.flash_serial.saturating_add(1);
+            self.flash_commit = Some((hash.to_string(), self.flash_serial));
+            true
+        } else {
+            false
         }
     }
 
@@ -1008,5 +1061,23 @@ mod tests {
         tab.filter.branch = None;
         tab.filter.author = Some("Alice".to_string());
         assert!(tab.should_truncate_missing_parents());
+    }
+
+    #[test]
+    fn trigger_commit_flash_increments_monotonically_and_bumps_matching_key() {
+        let (_dir, engine, hashes) = init_test_repo();
+        let mut tab = RepoTabState::new(1, engine);
+
+        let s1 = tab.trigger_commit_flash(&hashes[0]);
+        assert_eq!(s1, 1);
+        assert_eq!(tab.flash_commit, Some((hashes[0].clone(), 1)));
+
+        assert!(tab.bump_commit_flash_key(&hashes[0], 1));
+        assert_eq!(tab.flash_commit, Some((hashes[0].clone(), 2)));
+        assert!(!tab.bump_commit_flash_key(&hashes[0], 1));
+
+        let s3 = tab.trigger_commit_flash(&hashes[1]);
+        assert_eq!(s3, 3);
+        assert_eq!(tab.flash_commit, Some((hashes[1].clone(), 3)));
     }
 }

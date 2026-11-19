@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ely_core::buttons::{Button, ButtonVariant, IconButton};
 use ely_core::feedback::{EmptyState, Toast, ToastViewport, Toaster};
@@ -11,6 +11,9 @@ use ely_core::forms::{InputEvent, TextInput};
 use ely_core::layout::SplitPane;
 use ely_core::lists::{List, ListItem};
 use ely_core::menus::{ContextMenu, Menu, MenuItem, OverflowMenu};
+use ely_core::motion::{
+    Entrance, FAST, Flash, Spinner, SpinnerStyle, Stagger, duration, ease_out_cubic, since_change,
+};
 use ely_core::primitives::{Icon, IconName, Severity};
 use ely_core::shell::{StatusBar, StatusBarItem, drag_region};
 use ely_core::theme::{ActiveTheme, ControlSize, IconSize, Mode, Radius, TextSize, Theme};
@@ -22,18 +25,19 @@ use git_graph_ops::{
     check_checkout_safety, check_reset_safety,
 };
 use gpui::{
-    AnyElement, Axis, Context, Entity, FocusHandle, InteractiveElement, IntoElement, MouseButton,
-    ParentElement, PathPromptOptions, Pixels, Point, Render, ScrollStrategy, SharedString,
-    Styled, Subscription, Window, div, prelude::*, px,
+    AnyElement, Axis, Context, ElementId, Entity, FocusHandle, InteractiveElement, IntoElement,
+    MouseButton, ParentElement, PathPromptOptions, Pixels, Point, Render, ScrollEvent,
+    ScrollStrategy, SharedString, Styled, Subscription, TouchPhase, Window, div, prelude::*, px,
 };
 
 use crate::modals::{
     ActiveModal, ContextMenuState, ContextMenuTarget, PendingWriteOp, build_context_menu,
     compute_push_defaults, render_active_modal,
 };
+use crate::motion_fx::{PullRefreshPhase, PullRefreshState, RubberBandSpring};
 use crate::repo_tab::{
-    FileSection, RepoTabState, SelectedFile, execute_history_search, load_commit_details,
-    load_file_diff, load_file_line_counts, load_repo_snapshot,
+    FileSection, PendingFlashTarget, RepoTabState, SelectedFile, execute_history_search,
+    load_commit_details, load_file_diff, load_file_line_counts, load_repo_snapshot,
 };
 use crate::state::{
     PersistedState, repo_display_name, save_persisted_state, short_hash,
@@ -71,6 +75,8 @@ pub struct GitGraphApp {
     pub opened_diff_stretches: Vec<usize>,
 
     pub modal: Option<ActiveModal>,
+    pub modal_serial: u64,
+    pub details_open_serial: u64,
     pub context_menu: Option<ContextMenuState>,
     pub next_ctx_request_id: u64,
     pub cli: Option<GitCli>,
@@ -115,6 +121,8 @@ impl GitGraphApp {
             diff_layout: DiffLayout::Unified,
             opened_diff_stretches: Vec::new(),
             modal: None,
+            modal_serial: 0,
+            details_open_serial: 0,
             context_menu: None,
             next_ctx_request_id: 1,
             cli,
@@ -365,6 +373,8 @@ impl GitGraphApp {
                 }
                 tab.loading_graph = false;
                 tab.loading_more = false;
+                let mut post_refresh_flash: Option<String> = None;
+                let mut schedule_pull_done_serial: Option<u64> = None;
                 match res {
                     Ok(snap) => {
                         tab.error = None;
@@ -378,6 +388,30 @@ impl GitGraphApp {
                         tab.sync_status = snap.sync_status;
                         tab.recompute_visible_rows();
                         let should_research = !soft && tab.is_search_active();
+
+                        if matches!(tab.pull_refresh.phase(), PullRefreshPhase::Refreshing) {
+                            tab.pull_refresh.finish_refresh();
+                            schedule_pull_done_serial = Some(tab.pull_refresh.serial());
+                        }
+
+                        if let Some(target) = tab.pending_flash_target.take() {
+                            let resolved = match target {
+                                PendingFlashTarget::Hash(h) => {
+                                    if tab.visible_index_of(&h).is_some() {
+                                        Some(h)
+                                    } else {
+                                        tab.head_hash.clone()
+                                    }
+                                }
+                                PendingFlashTarget::Head => tab.head_hash.clone(),
+                            };
+                            if let Some(hash) = resolved
+                                && let Some(ix) = tab.visible_index_of(&hash)
+                            {
+                                tab.graph_scroll.scroll_to_item(ix, ScrollStrategy::Center);
+                                post_refresh_flash = Some(hash);
+                            }
+                        }
 
                         // 软刷新时若之前选中了某提交或未提交行，同步刷新详情与 diff
                         if let Some(sel) = tab.selected_hash.clone() {
@@ -399,7 +433,17 @@ impl GitGraphApp {
                     }
                     Err(err) => {
                         tab.error = Some(err);
+                        tab.pending_flash_target = None;
+                        if matches!(tab.pull_refresh.phase(), PullRefreshPhase::Refreshing) {
+                            tab.pull_refresh.cancel();
+                        }
                     }
+                }
+                if let Some(done_serial) = schedule_pull_done_serial {
+                    this.schedule_pull_refresh_done_hide(tab_id, done_serial, cx);
+                }
+                if let Some(hash) = post_refresh_flash {
+                    this.trigger_commit_flash(tab_id, hash, cx);
                 }
                 cx.notify();
             })
@@ -425,21 +469,33 @@ impl GitGraphApp {
         let Some(tab_id) = self.active_tab_id else {
             return;
         };
+        let mut should_bump_details = false;
         if !self.persisted.details_open {
             self.persisted.details_open = true;
             self.save_state();
+            should_bump_details = true;
         }
         let Some(tab) = self.tab_by_id_mut(tab_id) else {
             return;
         };
         if tab.selected_hash.as_deref() == Some(hash.as_str()) {
+            if should_bump_details {
+                self.details_open_serial = self.details_open_serial.saturating_add(1);
+                cx.notify();
+            }
             return;
+        }
+        if tab.selected_hash.is_none() {
+            should_bump_details = true;
         }
         tab.selected_hash = Some(hash.clone());
         tab.details = None;
         tab.line_counts.clear();
         tab.selected_file = None;
         tab.file_view = None;
+        if should_bump_details {
+            self.details_open_serial = self.details_open_serial.saturating_add(1);
+        }
         self.opened_diff_stretches.clear();
         self.load_tab_details(tab_id, hash, false, cx);
         cx.notify();
@@ -843,12 +899,15 @@ impl GitGraphApp {
     }
 
     pub fn jump_to_commit(&mut self, hash: String, cx: &mut Context<Self>) {
-        let visible_ix = self.active_tab().and_then(|t| t.visible_index_of(&hash));
-        if let Some(ix) = visible_ix {
+        let info = self
+            .active_tab()
+            .and_then(|t| t.visible_index_of(&hash).map(|ix| (t.id, ix)));
+        if let Some((tab_id, ix)) = info {
             if let Some(tab) = self.active_tab() {
                 tab.graph_scroll.scroll_to_item(ix, ScrollStrategy::Center);
             }
-            self.select_commit(hash, cx);
+            self.select_commit(hash.clone(), cx);
+            self.trigger_commit_flash(tab_id, hash, cx);
         } else {
             self.push_toast(
                 "未在当前视图中找到该提交",
@@ -859,8 +918,52 @@ impl GitGraphApp {
         }
     }
 
+    /// 触发指定提交行的 900ms 定位高亮闪动（仅作用于目标单行）。
+    pub fn trigger_commit_flash(&mut self, tab_id: u64, hash: String, cx: &mut Context<Self>) {
+        let Some(tab) = self.tab_by_id_mut(tab_id) else {
+            return;
+        };
+        let initial_serial = tab.trigger_commit_flash(hash.clone());
+        let hash_defer = hash.clone();
+        let weak = cx.weak_entity();
+        cx.defer(move |cx| {
+            weak.update(cx, |this, cx| {
+                if let Some(tab) = this.tab_by_id_mut(tab_id)
+                    && tab.bump_commit_flash_key(&hash_defer, initial_serial)
+                {
+                    cx.notify();
+                }
+            })
+            .ok();
+        });
+
+        let cleanup_delay = if cx.theme().reduced_motion {
+            Duration::from_millis(40)
+        } else {
+            Duration::from_millis(1_000)
+        };
+        cx.spawn(async move |weak, cx| {
+            cx.background_executor().timer(cleanup_delay).await;
+            weak.update(cx, |this, cx| {
+                if let Some(tab) = this.tab_by_id_mut(tab_id)
+                    && let Some((h, s)) = &tab.flash_commit
+                    && h == &hash
+                    && *s <= initial_serial.saturating_add(1)
+                {
+                    tab.flash_commit = None;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     pub fn toggle_details_pane(&mut self, cx: &mut Context<Self>) {
         self.persisted.details_open = !self.persisted.details_open;
+        if self.persisted.details_open {
+            self.details_open_serial = self.details_open_serial.saturating_add(1);
+        }
         self.save_state();
         cx.notify();
     }
@@ -902,19 +1005,229 @@ impl GitGraphApp {
         self.scroll_latch.classify(event)
     }
 
-    /// 水平滚动当前活动仓库的图形列（整列同步平移，保持跨行泳道对齐）。
-    pub fn scroll_graph_x(&mut self, delta_x: f32, cx: &mut Context<Self>) {
+    /// 水平滚动当前活动仓库的图形列（整列同步平移，并在触边时施加阻尼橡皮筋回弹）。
+    pub fn handle_graph_horizontal_scroll(
+        &mut self,
+        delta_x: f32,
+        touch_phase: TouchPhase,
+        cx: &mut Context<Self>,
+    ) {
+        let reduced_motion = cx.theme().reduced_motion;
         let widths = self.persisted.column_widths.clone();
-        let Some(tab) = self.active_tab_mut() else {
+        let Some(tab_id) = self.active_tab_id else {
             return;
         };
-        let graph_col_w = crate::ui_graph::effective_graph_width(tab, &widths);
-        let max_scroll = crate::ui_graph::max_graph_scroll_x(tab, graph_col_w);
-        let next = (tab.graph_scroll_x - delta_x).clamp(0.0, max_scroll);
-        if (next - tab.graph_scroll_x).abs() > 0.01 {
-            tab.graph_scroll_x = next;
+        let Some(tab) = self.tab_by_id_mut(tab_id) else {
+            return;
+        };
+
+        if touch_phase == TouchPhase::Cancelled {
+            tab._graph_overscroll_task = None;
+            tab.graph_overscroll.release(reduced_motion);
+            cx.notify();
+            return;
+        }
+
+        if delta_x.abs() > 0.01 {
+            let now = Instant::now();
+            let remaining = tab
+                .graph_overscroll
+                .consume_opposite(delta_x, now, reduced_motion);
+
+            if remaining.abs() > 0.01 {
+                let graph_col_w = crate::ui_graph::effective_graph_width(tab, &widths);
+                let max_scroll = crate::ui_graph::max_graph_scroll_x(tab, graph_col_w);
+                let target = tab.graph_scroll_x - remaining;
+                let clamped = target.clamp(0.0, max_scroll);
+                tab.graph_scroll_x = clamped;
+
+                // remaining > 0 且到达最左 (target < 0) => 左触边正向过冲；
+                // remaining < 0 且到达最右 (target > max_scroll) => 右触边负向过冲。
+                let overflow = clamped - target;
+                if overflow.abs() > 0.01 {
+                    tab.graph_overscroll.pull_at(overflow, now, reduced_motion);
+                }
+            }
+        }
+
+        if touch_phase == TouchPhase::Ended {
+            tab._graph_overscroll_task = None;
+            tab.graph_overscroll.release(reduced_motion);
+            cx.notify();
+            return;
+        }
+
+        if tab.graph_overscroll.is_active() && !reduced_motion {
+            tab._graph_overscroll_task = Some(cx.spawn(async move |weak, cx| {
+                cx.background_executor()
+                    .timer(RubberBandSpring::IDLE_RELEASE_TIMEOUT + Duration::from_millis(8))
+                    .await;
+                weak.update(cx, |this, cx| {
+                    let reduced = cx.theme().reduced_motion;
+                    if let Some(tab) = this.tab_by_id_mut(tab_id)
+                        && tab.graph_overscroll.needs_idle_release(Instant::now())
+                    {
+                        tab.graph_overscroll.release(reduced);
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }));
+        }
+        cx.notify();
+    }
+
+    /// 处理主提交列表的顶部下拉刷新与底部触底阻尼弹性反馈。
+    pub fn handle_graph_list_vertical_scroll(
+        &mut self,
+        event: &ScrollEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if event.modifiers.shift {
+            return;
+        }
+        let delta = event.delta.pixel_delta(px(28.0));
+        let dx = f32::from(delta.x);
+        let dy = f32::from(delta.y);
+        if dx.abs() > dy.abs() && dx.abs() > 0.5 {
+            return;
+        }
+
+        let reduced_motion = cx.theme().reduced_motion;
+        let Some(tab_id) = self.active_tab_id else {
+            return;
+        };
+        let Some(tab) = self.tab_by_id_mut(tab_id) else {
+            return;
+        };
+
+        if event.touch_phase == TouchPhase::Cancelled {
+            tab._pull_refresh_task = None;
+            tab._bottom_overscroll_task = None;
+            tab.pull_refresh.cancel();
+            tab.bottom_overscroll.release(reduced_motion);
+            cx.notify();
+            return;
+        }
+
+        if event.touch_phase == TouchPhase::Ended {
+            tab._pull_refresh_task = None;
+            tab._bottom_overscroll_task = None;
+            let triggered = tab.pull_refresh.release(reduced_motion);
+            tab.bottom_overscroll.release(reduced_motion);
+            if triggered {
+                self.soft_refresh_tab(tab_id, cx);
+            }
+            cx.notify();
+            return;
+        }
+
+        if tab.visible_commit_count() == 0 || tab.loading_graph {
+            return;
+        }
+
+        let (at_top, at_bottom) = {
+            let state = tab.graph_scroll.0.borrow();
+            let offset_y = state.base_handle.offset().y;
+            let max_y = state.base_handle.max_offset().y;
+            let top = offset_y >= px(-1.0);
+            let bottom = max_y <= px(0.0) || -offset_y >= max_y - px(1.0);
+            (top, bottom)
+        };
+
+        let now = Instant::now();
+        let mut pull_active = false;
+        let mut bottom_active = false;
+
+        if dy > 0.01 {
+            if tab.bottom_overscroll.offset() < -0.01 {
+                let rem = tab
+                    .bottom_overscroll
+                    .consume_opposite(dy, now, reduced_motion);
+                bottom_active = tab.bottom_overscroll.is_active();
+                if rem > 0.01 && at_top && !tab.is_search_active() {
+                    tab.pull_refresh.pull_at(rem, now);
+                    pull_active = matches!(tab.pull_refresh.phase(), PullRefreshPhase::Pulling { .. });
+                }
+            } else if at_top && !tab.is_search_active() {
+                tab.pull_refresh.pull_at(dy, now);
+                pull_active = matches!(tab.pull_refresh.phase(), PullRefreshPhase::Pulling { .. });
+            }
+        } else if dy < -0.01 {
+            if matches!(tab.pull_refresh.phase(), PullRefreshPhase::Pulling { .. }) {
+                tab.pull_refresh.pull_at(dy, now);
+                pull_active = matches!(tab.pull_refresh.phase(), PullRefreshPhase::Pulling { .. });
+            } else if at_bottom && !tab.more_available {
+                tab.bottom_overscroll.pull_at(dy, now, reduced_motion);
+                bottom_active = tab.bottom_overscroll.is_active();
+            }
+        }
+
+        if pull_active {
+            tab._pull_refresh_task = Some(cx.spawn(async move |weak, cx| {
+                cx.background_executor()
+                    .timer(PullRefreshState::IDLE_RELEASE_TIMEOUT + Duration::from_millis(8))
+                    .await;
+                weak.update(cx, |this, cx| {
+                    let reduced = cx.theme().reduced_motion;
+                    let triggered = this
+                        .tab_by_id_mut(tab_id)
+                        .is_some_and(|tab| tab.pull_refresh.tick(reduced).trigger_refresh);
+                    if triggered {
+                        this.soft_refresh_tab(tab_id, cx);
+                    }
+                    cx.notify();
+                })
+                .ok();
+            }));
+        }
+
+        if bottom_active && !reduced_motion {
+            tab._bottom_overscroll_task = Some(cx.spawn(async move |weak, cx| {
+                cx.background_executor()
+                    .timer(RubberBandSpring::IDLE_RELEASE_TIMEOUT + Duration::from_millis(8))
+                    .await;
+                weak.update(cx, |this, cx| {
+                    let reduced = cx.theme().reduced_motion;
+                    if let Some(tab) = this.tab_by_id_mut(tab_id)
+                        && tab.bottom_overscroll.needs_idle_release(Instant::now())
+                    {
+                        tab.bottom_overscroll.release(reduced);
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }));
+        }
+
+        if pull_active || bottom_active || tab.pull_refresh.is_animating() {
             cx.notify();
         }
+    }
+
+    fn schedule_pull_refresh_done_hide(
+        &mut self,
+        tab_id: u64,
+        done_serial: u64,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tab_by_id_mut(tab_id) else {
+            return;
+        };
+        tab._pull_refresh_task = Some(cx.spawn(async move |weak, cx| {
+            cx.background_executor()
+                .timer(PullRefreshState::DONE_HOLD_DURATION)
+                .await;
+            weak.update(cx, |this, cx| {
+                if let Some(tab) = this.tab_by_id_mut(tab_id)
+                    && tab.pull_refresh.serial() == done_serial
+                {
+                    tab.pull_refresh.finish_done();
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
     }
 
     /// 将当前活动仓库图形列的水平滚动位置一键复位到最左侧。
@@ -922,7 +1235,10 @@ impl GitGraphApp {
         let Some(tab) = self.active_tab_mut() else {
             return;
         };
-        if tab.graph_scroll_x > 0.0 {
+        let had_overscroll = tab.graph_overscroll.is_active();
+        tab.graph_overscroll.reset();
+        tab._graph_overscroll_task = None;
+        if tab.graph_scroll_x > 0.0 || had_overscroll {
             tab.graph_scroll_x = 0.0;
             cx.notify();
         }
@@ -982,6 +1298,12 @@ impl GitGraphApp {
         }
     }
 
+    fn set_modal(&mut self, modal: ActiveModal, cx: &mut Context<Self>) {
+        self.modal_serial = self.modal_serial.saturating_add(1);
+        self.modal = Some(modal);
+        cx.notify();
+    }
+
     pub fn open_create_branch_modal(
         &mut self,
         repo_path: PathBuf,
@@ -1000,13 +1322,17 @@ impl GitGraphApp {
                 }
             });
         }
-        self.modal = Some(ActiveModal::CreateBranch {
-            repo_path,
-            start_point,
-            input,
-            checkout: true,
-        });
-        cx.notify();
+        self.set_modal(
+            ActiveModal::CreateBranch {
+                repo_path,
+                start_point,
+                input,
+                checkout: true,
+                shake_serial: 0,
+                validation_error: None,
+            },
+            cx,
+        );
     }
 
     pub fn open_rename_branch_modal(
@@ -1024,12 +1350,16 @@ impl GitGraphApp {
                 input.select(0..len, cx);
             }
         });
-        self.modal = Some(ActiveModal::RenameBranch {
-            repo_path,
-            old_name,
-            input,
-        });
-        cx.notify();
+        self.set_modal(
+            ActiveModal::RenameBranch {
+                repo_path,
+                old_name,
+                input,
+                shake_serial: 0,
+                validation_error: None,
+            },
+            cx,
+        );
     }
 
     pub fn open_create_tag_modal(
@@ -1041,13 +1371,17 @@ impl GitGraphApp {
     ) {
         let name_input = cx.new(|cx| TextInput::new(window, cx).placeholder("v1.0.0"));
         let message_input = cx.new(|cx| TextInput::new(window, cx).placeholder("可选附注说明"));
-        self.modal = Some(ActiveModal::CreateTag {
-            repo_path,
-            target,
-            name_input,
-            message_input,
-        });
-        cx.notify();
+        self.set_modal(
+            ActiveModal::CreateTag {
+                repo_path,
+                target,
+                name_input,
+                message_input,
+                shake_serial: 0,
+                validation_error: None,
+            },
+            cx,
+        );
     }
 
     pub fn open_stash_push_modal(
@@ -1057,12 +1391,14 @@ impl GitGraphApp {
         cx: &mut Context<Self>,
     ) {
         let message_input = cx.new(|cx| TextInput::new(window, cx).placeholder("输入 Stash 描述（可留空）"));
-        self.modal = Some(ActiveModal::StashPush {
-            repo_path,
-            message_input,
-            include_untracked: true,
-        });
-        cx.notify();
+        self.set_modal(
+            ActiveModal::StashPush {
+                repo_path,
+                message_input,
+                include_untracked: true,
+            },
+            cx,
+        );
     }
 
     pub fn open_push_branch_modal(
@@ -1118,19 +1454,23 @@ impl GitGraphApp {
                 remote_branch_input.update(cx, |input, cx| {
                     input.set_text(defaults.remote_branch.clone(), cx);
                 });
-                this.modal = Some(ActiveModal::PushBranch {
-                    repo_path,
-                    local_branches,
-                    selected_branch: target_branch,
-                    upstreams,
-                    remotes,
-                    selected_remote: defaults.remote,
-                    remote_branch_input,
-                    set_upstream: defaults.set_upstream,
-                    push_tags: false,
-                    force: PushForceMode::None,
-                });
-                cx.notify();
+                this.set_modal(
+                    ActiveModal::PushBranch {
+                        repo_path,
+                        local_branches,
+                        selected_branch: target_branch,
+                        upstreams,
+                        remotes,
+                        selected_remote: defaults.remote,
+                        remote_branch_input,
+                        set_upstream: defaults.set_upstream,
+                        push_tags: false,
+                        force: PushForceMode::None,
+                        shake_serial: 0,
+                        validation_error: None,
+                    },
+                    cx,
+                );
             })
             .ok();
         })
@@ -1188,6 +1528,9 @@ impl GitGraphApp {
                         }
                         match res {
                             Ok(outcome) => {
+                                if let Some(tab) = this.tab_by_id_mut(tab_id) {
+                                    tab.sync_flash_serial = tab.sync_flash_serial.saturating_add(1);
+                                }
                                 let detail = match (outcome.pulled, outcome.pushed) {
                                     (true, true) => Some("已拉取远端更新并推送本地提交。".to_string()),
                                     (true, false) => Some("已拉取远端更新。".to_string()),
@@ -1239,6 +1582,9 @@ impl GitGraphApp {
                         }
                         match res {
                             Ok(_) => {
+                                if let Some(tab) = this.tab_by_id_mut(tab_id) {
+                                    tab.sync_flash_serial = tab.sync_flash_serial.saturating_add(1);
+                                }
                                 this.push_toast(
                                     format!("已发布分支 {branch_label} 到 {remote_label}"),
                                     Severity::Success,
@@ -1290,6 +1636,7 @@ impl GitGraphApp {
                     &repo_for_refresh,
                     format!("已推送 {target_label}"),
                     "推送分支失败",
+                    None,
                     res,
                     cx,
                 );
@@ -1318,12 +1665,14 @@ impl GitGraphApp {
                 .await;
             weak.update(cx, |this, cx| match safety {
                 Ok(Some(warning)) => {
-                    this.modal = Some(ActiveModal::SafetyConfirm {
-                        warning,
-                        confirm_label: format!("仍然检出 {branch}").into(),
-                        pending,
-                    });
-                    cx.notify();
+                    this.set_modal(
+                        ActiveModal::SafetyConfirm {
+                            warning,
+                            confirm_label: format!("仍然检出 {branch}").into(),
+                            pending,
+                        },
+                        cx,
+                    );
                 }
                 Ok(None) | Err(_) => {
                     this.execute_pending_write(pending, cx);
@@ -1354,12 +1703,14 @@ impl GitGraphApp {
                 .await;
             weak.update(cx, |this, cx| match safety {
                 Ok(Some(warning)) => {
-                    this.modal = Some(ActiveModal::SafetyConfirm {
-                        warning,
-                        confirm_label: format!("仍然检出 {short}").into(),
-                        pending,
-                    });
-                    cx.notify();
+                    this.set_modal(
+                        ActiveModal::SafetyConfirm {
+                            warning,
+                            confirm_label: format!("仍然检出 {short}").into(),
+                            pending,
+                        },
+                        cx,
+                    );
                 }
                 Ok(None) | Err(_) => {
                     this.execute_pending_write(pending, cx);
@@ -1392,12 +1743,14 @@ impl GitGraphApp {
                 .await;
             weak.update(cx, |this, cx| match safety {
                 Ok(Some(warning)) => {
-                    this.modal = Some(ActiveModal::SafetyConfirm {
-                        warning,
-                        confirm_label: "确认 Hard Reset".into(),
-                        pending,
-                    });
-                    cx.notify();
+                    this.set_modal(
+                        ActiveModal::SafetyConfirm {
+                            warning,
+                            confirm_label: "确认 Hard Reset".into(),
+                            pending,
+                        },
+                        cx,
+                    );
                 }
                 Ok(None) | Err(_) => {
                     let mode_label = match mode {
@@ -1405,14 +1758,16 @@ impl GitGraphApp {
                         ResetMode::Mixed => "Mixed",
                         ResetMode::Hard => "Hard",
                     };
-                    this.modal = Some(ActiveModal::SimpleConfirm {
-                        title: format!("Reset ({mode_label}) 到 {short}？").into(),
-                        message: format!("将把当前分支指针重置到提交 {short}。").into(),
-                        confirm_label: format!("执行 Reset ({mode_label})").into(),
-                        destructive: mode == ResetMode::Hard,
-                        pending,
-                    });
-                    cx.notify();
+                    this.set_modal(
+                        ActiveModal::SimpleConfirm {
+                            title: format!("Reset ({mode_label}) 到 {short}？").into(),
+                            message: format!("将把当前分支指针重置到提交 {short}。").into(),
+                            confirm_label: format!("执行 Reset ({mode_label})").into(),
+                            destructive: mode == ResetMode::Hard,
+                            pending,
+                        },
+                        cx,
+                    );
                 }
             })
             .ok();
@@ -1426,54 +1781,62 @@ impl GitGraphApp {
         branch: String,
         cx: &mut Context<Self>,
     ) {
-        self.modal = Some(ActiveModal::SimpleConfirm {
-            title: format!("删除本地分支 {branch}？").into(),
-            message: "将执行 git branch -d 删除该分支（若有未合并提交则会阻止删除）。".into(),
-            confirm_label: "删除分支".into(),
-            destructive: true,
-            pending: PendingWriteOp::DeleteBranch {
-                repo_path,
-                name: branch,
-                force: false,
+        self.set_modal(
+            ActiveModal::SimpleConfirm {
+                title: format!("删除本地分支 {branch}？").into(),
+                message: "将执行 git branch -d 删除该分支（若有未合并提交则会阻止删除）。".into(),
+                confirm_label: "删除分支".into(),
+                destructive: true,
+                pending: PendingWriteOp::DeleteBranch {
+                    repo_path,
+                    name: branch,
+                    force: false,
+                },
             },
-        });
-        cx.notify();
+            cx,
+        );
     }
 
     pub fn confirm_delete_tag(&mut self, repo_path: PathBuf, tag: String, cx: &mut Context<Self>) {
-        self.modal = Some(ActiveModal::SimpleConfirm {
-            title: format!("删除本地标签 {tag}？").into(),
-            message: "将从本地仓库移除该标签引用。".into(),
-            confirm_label: "删除标签".into(),
-            destructive: true,
-            pending: PendingWriteOp::DeleteTag {
-                repo_path,
-                name: tag,
+        self.set_modal(
+            ActiveModal::SimpleConfirm {
+                title: format!("删除本地标签 {tag}？").into(),
+                message: "将从本地仓库移除该标签引用。".into(),
+                confirm_label: "删除标签".into(),
+                destructive: true,
+                pending: PendingWriteOp::DeleteTag {
+                    repo_path,
+                    name: tag,
+                },
             },
-        });
-        cx.notify();
+            cx,
+        );
     }
 
     pub fn confirm_stash_pop(&mut self, repo_path: PathBuf, index: usize, cx: &mut Context<Self>) {
-        self.modal = Some(ActiveModal::SimpleConfirm {
-            title: format!("弹出 stash@{{{index}}}？").into(),
-            message: "将应用该 Stash 到工作区并从 Stash 栈中移除。".into(),
-            confirm_label: "弹出 Stash".into(),
-            destructive: false,
-            pending: PendingWriteOp::StashPop { repo_path, index },
-        });
-        cx.notify();
+        self.set_modal(
+            ActiveModal::SimpleConfirm {
+                title: format!("弹出 stash@{{{index}}}？").into(),
+                message: "将应用该 Stash 到工作区并从 Stash 栈中移除。".into(),
+                confirm_label: "弹出 Stash".into(),
+                destructive: false,
+                pending: PendingWriteOp::StashPop { repo_path, index },
+            },
+            cx,
+        );
     }
 
     pub fn confirm_stash_drop(&mut self, repo_path: PathBuf, index: usize, cx: &mut Context<Self>) {
-        self.modal = Some(ActiveModal::SimpleConfirm {
-            title: format!("丢弃 stash@{{{index}}}？").into(),
-            message: "丢弃后该 Stash 中的修改记录将很难恢复。".into(),
-            confirm_label: "丢弃 Stash".into(),
-            destructive: true,
-            pending: PendingWriteOp::StashDrop { repo_path, index },
-        });
-        cx.notify();
+        self.set_modal(
+            ActiveModal::SimpleConfirm {
+                title: format!("丢弃 stash@{{{index}}}？").into(),
+                message: "丢弃后该 Stash 中的修改记录将很难恢复。".into(),
+                confirm_label: "丢弃 Stash".into(),
+                destructive: true,
+                pending: PendingWriteOp::StashDrop { repo_path, index },
+            },
+            cx,
+        );
     }
 
     pub fn confirm_discard_file(
@@ -1482,17 +1845,19 @@ impl GitGraphApp {
         file_path: String,
         cx: &mut Context<Self>,
     ) {
-        self.modal = Some(ActiveModal::SimpleConfirm {
-            title: "丢弃工作区修改？".into(),
-            message: format!("确定要丢弃文件 {file_path} 中未暂存的修改吗？此操作不可撤销。").into(),
-            confirm_label: "丢弃修改".into(),
-            destructive: true,
-            pending: PendingWriteOp::DiscardFile {
-                repo_path,
-                file_path,
+        self.set_modal(
+            ActiveModal::SimpleConfirm {
+                title: "丢弃工作区修改？".into(),
+                message: format!("确定要丢弃文件 {file_path} 中未暂存的修改吗？此操作不可撤销。").into(),
+                confirm_label: "丢弃修改".into(),
+                destructive: true,
+                pending: PendingWriteOp::DiscardFile {
+                    repo_path,
+                    file_path,
+                },
             },
-        });
-        cx.notify();
+            cx,
+        );
     }
 
     pub fn run_create_branch(
@@ -1508,6 +1873,7 @@ impl GitGraphApp {
         };
         let repo_for_refresh = repo_path.clone();
         let label = name.clone();
+        let flash_target = Some(PendingFlashTarget::Hash(start_point.clone()));
         cx.spawn(async move |weak, cx| {
             let res = cx
                 .background_spawn(async move {
@@ -1519,6 +1885,7 @@ impl GitGraphApp {
                     &repo_for_refresh,
                     format!("已创建分支 {label}"),
                     "创建分支失败",
+                    flash_target,
                     res,
                     cx,
                 );
@@ -1556,6 +1923,7 @@ impl GitGraphApp {
                     &repo_for_refresh,
                     format!("已将分支 {old_label} 重命名为 {new_label}"),
                     "重命名分支失败",
+                    None,
                     res,
                     cx,
                 );
@@ -1578,6 +1946,7 @@ impl GitGraphApp {
         };
         let repo_for_refresh = repo_path.clone();
         let label = name.clone();
+        let flash_target = Some(PendingFlashTarget::Hash(target.clone()));
         cx.spawn(async move |weak, cx| {
             let res = cx
                 .background_spawn(async move {
@@ -1589,6 +1958,7 @@ impl GitGraphApp {
                     &repo_for_refresh,
                     format!("已创建标签 {label}"),
                     "创建标签失败",
+                    flash_target,
                     res,
                     cx,
                 );
@@ -1628,6 +1998,7 @@ impl GitGraphApp {
                     &repo_for_refresh,
                     "已保存工作区到 Stash",
                     "保存 Stash 失败",
+                    Some(PendingFlashTarget::Head),
                     res,
                     cx,
                 );
@@ -1651,6 +2022,7 @@ impl GitGraphApp {
                     &repo_for_refresh,
                     format!("已应用 stash@{{{index}}}"),
                     "应用 Stash 失败",
+                    Some(PendingFlashTarget::Head),
                     res,
                     cx,
                 );
@@ -1680,6 +2052,7 @@ impl GitGraphApp {
                     &repo_for_refresh,
                     format!("已暂存 {label}"),
                     "暂存文件失败",
+                    None,
                     res,
                     cx,
                 );
@@ -1709,6 +2082,7 @@ impl GitGraphApp {
                     &repo_for_refresh,
                     format!("已取消暂存 {label}"),
                     "取消暂存失败",
+                    None,
                     res,
                     cx,
                 );
@@ -1722,16 +2096,18 @@ impl GitGraphApp {
         let Some(cli) = self.ensure_cli(cx) else {
             return;
         };
-        let (repo_for_refresh, ok_msg, err_title) = match &op {
+        let (repo_for_refresh, ok_msg, err_title, flash_target) = match &op {
             PendingWriteOp::CheckoutBranch { repo_path, branch } => (
                 repo_path.clone(),
                 format!("已切换到分支 {branch}"),
                 "检出分支失败",
+                Some(PendingFlashTarget::Head),
             ),
             PendingWriteOp::CheckoutCommit { repo_path, hash } => (
                 repo_path.clone(),
                 format!("已检出提交 {}", short_hash(hash)),
                 "检出提交失败",
+                Some(PendingFlashTarget::Hash(hash.clone())),
             ),
             PendingWriteOp::DeleteBranch {
                 repo_path, name, ..
@@ -1739,21 +2115,25 @@ impl GitGraphApp {
                 repo_path.clone(),
                 format!("已删除分支 {name}"),
                 "删除分支失败",
+                None,
             ),
             PendingWriteOp::DeleteTag { repo_path, name } => (
                 repo_path.clone(),
                 format!("已删除标签 {name}"),
                 "删除标签失败",
+                None,
             ),
             PendingWriteOp::CherryPick { repo_path, hash } => (
                 repo_path.clone(),
                 format!("已 Cherry-pick {}", short_hash(hash)),
                 "Cherry-pick 失败",
+                Some(PendingFlashTarget::Head),
             ),
             PendingWriteOp::RevertCommit { repo_path, hash } => (
                 repo_path.clone(),
                 format!("已 Revert {}", short_hash(hash)),
                 "Revert 失败",
+                Some(PendingFlashTarget::Head),
             ),
             PendingWriteOp::ResetToCommit {
                 repo_path, hash, ..
@@ -1761,16 +2141,19 @@ impl GitGraphApp {
                 repo_path.clone(),
                 format!("已 Reset 到 {}", short_hash(hash)),
                 "Reset 失败",
+                Some(PendingFlashTarget::Hash(hash.clone())),
             ),
             PendingWriteOp::StashPop { repo_path, index } => (
                 repo_path.clone(),
                 format!("已弹出 stash@{{{index}}}"),
                 "弹出 Stash 失败",
+                Some(PendingFlashTarget::Head),
             ),
             PendingWriteOp::StashDrop { repo_path, index } => (
                 repo_path.clone(),
                 format!("已丢弃 stash@{{{index}}}"),
                 "丢弃 Stash 失败",
+                None,
             ),
             PendingWriteOp::DiscardFile {
                 repo_path,
@@ -1779,6 +2162,7 @@ impl GitGraphApp {
                 repo_path.clone(),
                 format!("已丢弃更改 {file_path}"),
                 "丢弃文件更改失败",
+                None,
             ),
         };
 
@@ -1826,7 +2210,14 @@ impl GitGraphApp {
                 .await;
 
             weak.update(cx, |this, cx| {
-                this.finish_write_op(&repo_for_refresh, ok_msg, err_title, res, cx);
+                this.finish_write_op(
+                    &repo_for_refresh,
+                    ok_msg,
+                    err_title,
+                    flash_target,
+                    res,
+                    cx,
+                );
             })
             .ok();
         })
@@ -1838,6 +2229,7 @@ impl GitGraphApp {
         repo_path: &std::path::Path,
         ok_title: impl Into<SharedString>,
         err_title: &'static str,
+        flash_target: Option<PendingFlashTarget>,
         res: git_graph_ops::Result<()>,
         cx: &mut Context<Self>,
     ) {
@@ -1846,6 +2238,7 @@ impl GitGraphApp {
                 self.push_toast(ok_title, Severity::Success, None, cx);
                 if let Some(tab) = self.tab_by_path_mut(repo_path) {
                     let id = tab.id;
+                    tab.pending_flash_target = flash_target;
                     self.soft_refresh_tab(id, cx);
                 }
             }
@@ -2160,66 +2553,109 @@ impl GitGraphApp {
             .flex_col()
             .items_center()
             .justify_center()
-            .gap_4()
             .p_6()
             .bg(colors.bg)
-            .child(empty)
-            .children(recent_section)
+            .child(
+                div().w_full().max_w(px(560.0)).child(
+                    Stagger::new("start-page-stagger")
+                        .entrance(Entrance::Rise)
+                        .child(
+                            div()
+                                .w_full()
+                                .flex()
+                                .justify_center()
+                                .mb_4()
+                                .child(empty),
+                        )
+                        .when_some(recent_section, |stagger, section| {
+                            stagger.child(
+                                div()
+                                    .w_full()
+                                    .flex()
+                                    .justify_center()
+                                    .child(section),
+                            )
+                        }),
+                ),
+            )
             .into_any_element()
     }
 
-    fn render_workspace_body(&self, cx: &mut Context<Self>) -> AnyElement {
-        let Some(tab) = self.active_tab() else {
-            return self.render_start_page(cx);
+    fn render_workspace_body(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let active_tab_key = self.active_tab_id.unwrap_or(0);
+        let tab_fade = since_change(
+            &ElementId::from("repo-tab-transition"),
+            active_tab_key,
+            duration(FAST, cx),
+            window,
+            cx,
+        );
+
+        let content: AnyElement = match self.active_tab() {
+            None => self.render_start_page(cx),
+            Some(tab) => {
+                let toolbar = render_filter_toolbar(self, tab, cx);
+                let graph_table = render_graph_table(self, tab, cx);
+
+                let main_area: AnyElement = if self.persisted.details_open {
+                    let details_pane = render_details_pane(self, tab, cx);
+                    let weak = cx.weak_entity();
+                    let v_sizes = self.persisted.vertical_split;
+                    SplitPane::new("main-v-split", Axis::Vertical, px(160.0))
+                        .pane(graph_table)
+                        .pane(details_pane)
+                        .sizes(&v_sizes)
+                        .on_resize(move |sizes, _, cx| {
+                            if sizes.len() == 2 {
+                                let pair = [sizes[0], sizes[1]];
+                                weak.update(cx, |this, _| this.set_vertical_split(pair))
+                                    .ok();
+                            }
+                        })
+                        .into_any_element()
+                } else {
+                    graph_table
+                };
+
+                let menu = match &self.context_menu {
+                    Some(ctx_menu) => build_context_menu(ctx_menu, cx.weak_entity()),
+                    None => Menu::new(),
+                };
+                let request = self
+                    .context_menu
+                    .as_ref()
+                    .map(|c| (c.request_id, c.position));
+
+                ContextMenu::new("workspace-context-menu", menu)
+                    .manual(request)
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .child(toolbar)
+                    .child(div().flex_1().min_h_0().child(main_area))
+                    .into_any_element()
+            }
         };
 
-        let toolbar = render_filter_toolbar(self, tab, cx);
-        let graph_table = render_graph_table(self, tab, cx);
-
-        let main_area: AnyElement = if self.persisted.details_open {
-            let details_pane = render_details_pane(self, tab, cx);
-            let weak = cx.weak_entity();
-            let v_sizes = self.persisted.vertical_split;
-            SplitPane::new("main-v-split", Axis::Vertical, px(160.0))
-                .pane(graph_table)
-                .pane(details_pane)
-                .sizes(&v_sizes)
-                .on_resize(move |sizes, _, cx| {
-                    if sizes.len() == 2 {
-                        let pair = [sizes[0], sizes[1]];
-                        weak.update(cx, |this, _| this.set_vertical_split(pair))
-                            .ok();
-                    }
-                })
-                .into_any_element()
-        } else {
-            graph_table
-        };
-
-        let menu = match &self.context_menu {
-            Some(ctx_menu) => build_context_menu(ctx_menu, cx.weak_entity()),
-            None => Menu::new(),
-        };
-        let request = self
-            .context_menu
-            .as_ref()
-            .map(|c| (c.request_id, c.position));
-
-        ContextMenu::new("workspace-context-menu", menu)
-            .manual(request)
+        div()
             .flex_1()
             .min_h_0()
             .w_full()
             .flex()
             .flex_col()
-            .child(toolbar)
-            .child(div().flex_1().min_h_0().child(main_area))
+            .when_some(tab_fade, |el, t| el.opacity(ease_out_cubic(t)))
+            .child(content)
             .into_any_element()
     }
 
     fn render_status_bar(&self, cx: &Context<Self>) -> StatusBar {
         let mut bar = StatusBar::new();
         let weak = cx.weak_entity();
+        let theme = cx.theme();
+        let colors = theme.colors.clone();
+        let sync_flash_radius = theme.radius(Radius::Sm);
         if let Some(tab) = self.active_tab() {
             let branch_label: SharedString = match tab.info.as_ref().and_then(|i| i.head.as_ref())
             {
@@ -2248,9 +2684,17 @@ impl GitGraphApp {
                     tab.sync_action_label.as_deref(),
                 );
                 let mut item = StatusBarItem::new("status-sync")
-                    .icon(spec.icon)
                     .label(spec.status_bar_label)
                     .tooltip(spec.tooltip);
+                if tab.syncing {
+                    item = item.leading(
+                        Spinner::new(("sync-spinner", tab.id))
+                            .style(SpinnerStyle::Ring)
+                            .size(IconSize::Xs),
+                    );
+                } else {
+                    item = item.icon(spec.icon);
+                }
                 if !spec.disabled {
                     let weak_sync = weak.clone();
                     item = item.on_click(move |_, _, cx| {
@@ -2259,7 +2703,11 @@ impl GitGraphApp {
                             .ok();
                     });
                 }
-                bar = bar.left(item);
+                let flashed = Flash::new(("sync-status-flash", tab.id), tab.sync_flash_serial)
+                    .tint(colors.success.opacity(0.28))
+                    .rounded(sync_flash_radius)
+                    .child(item);
+                bar = bar.left(flashed);
             }
 
             bar = bar
@@ -2289,13 +2737,35 @@ impl GitGraphApp {
 
 impl Render for GitGraphApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let reduced_motion = cx.theme().reduced_motion;
+        if let Some(tab) = self.active_tab_mut() {
+            let tab_id = tab.id;
+            let mut need_frame = false;
+            if tab.graph_overscroll.is_active() && tab.graph_overscroll.tick(reduced_motion) {
+                need_frame = true;
+            }
+            if tab.bottom_overscroll.is_active() && tab.bottom_overscroll.tick(reduced_motion) {
+                need_frame = true;
+            }
+            let pr = tab.pull_refresh.tick(reduced_motion);
+            if pr.animating {
+                need_frame = true;
+            }
+            if pr.trigger_refresh {
+                self.soft_refresh_tab(tab_id, cx);
+            }
+            if need_frame {
+                window.request_animation_frame();
+            }
+        }
+
         let colors = cx.theme().colors.clone();
         let weak = cx.weak_entity();
 
         let modal_el = self
             .modal
             .as_ref()
-            .map(|m| render_active_modal(m, weak.clone(), cx));
+            .map(|m| render_active_modal(m, self.modal_serial, weak.clone(), cx));
 
         div()
             .size_full()
@@ -2326,7 +2796,7 @@ impl Render for GitGraphApp {
                 this.focus_search(window, cx);
             }))
             .child(self.render_titlebar(window, cx))
-            .child(self.render_workspace_body(cx))
+            .child(self.render_workspace_body(window, cx))
             .child(self.render_status_bar(cx))
             .children(modal_el)
             .child(ToastViewport::new("app-toasts", &self.toaster))

@@ -4,6 +4,7 @@ mod app_view;
 mod diff_parser;
 mod graph_canvas;
 mod modals;
+mod motion_fx;
 mod repo_tab;
 mod state;
 mod ui_details;

@@ -50,6 +50,8 @@ pub struct GraphCellStyle {
     pub row_height: Pixels,
     pub lane_width: Pixels,
     pub scroll_x: f32,
+    /// 左右触边橡皮筋弹性偏移（px，正值表示左触边向右过冲，负值表示右触边向左过冲）。
+    pub overscroll_x: f32,
     pub has_overflow_left: bool,
     pub has_overflow_right: bool,
     pub dark: bool,
@@ -58,6 +60,7 @@ pub struct GraphCellStyle {
     pub stash_color: Hsla,
     pub border_color: Hsla,
     pub overflow_hint_color: Hsla,
+    pub overscroll_glow_color: Hsla,
 }
 
 /// 渲染单行的图形列单元格。
@@ -67,6 +70,7 @@ pub fn paint_graph_cell(row: RowLayout, style: GraphCellStyle) -> AnyElement {
         row_height,
         lane_width,
         scroll_x,
+        overscroll_x,
         has_overflow_left,
         has_overflow_right,
         dark,
@@ -75,12 +79,13 @@ pub fn paint_graph_cell(row: RowLayout, style: GraphCellStyle) -> AnyElement {
         stash_color,
         border_color,
         overflow_hint_color,
+        overscroll_glow_color,
     } = style;
     canvas(
         |_, _, _| {},
         move |bounds: Bounds<Pixels>, _, window, _| {
             window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
-                let left_pad = px(10.0) - px(scroll_x.max(0.0));
+                let left_pad = px(10.0) - px(scroll_x.max(0.0)) + px(overscroll_x);
                 let lane_x = |lane: usize| -> Pixels {
                     bounds.origin.x + left_pad + lane_width * (lane as f32 + 0.5)
                 };
@@ -138,6 +143,40 @@ pub fn paint_graph_cell(row: RowLayout, style: GraphCellStyle) -> AnyElement {
                             size(hint_w, bounds.size.height),
                         ),
                         overflow_hint_color,
+                    ));
+                }
+
+                // 4. 左右触边橡皮筋回弹时，在对应边缘绘制柔和动态呼吸光晕（严格裁剪在 ContentMask 内）
+                if overscroll_x.abs() > 0.25 {
+                    let ratio = (overscroll_x.abs() / 28.0).clamp(0.0, 1.0);
+                    let glow_w = px(6.0 + 14.0 * ratio);
+                    let bands = 4usize;
+                    let band_w = glow_w / bands as f32;
+                    for i in 0..bands {
+                        let t = i as f32 / bands as f32;
+                        let alpha = 0.24 * ratio * (1.0 - t) * (1.0 - t);
+                        let x = if overscroll_x > 0.0 {
+                            bounds.origin.x + band_w * i as f32
+                        } else {
+                            bounds.origin.x + bounds.size.width - band_w * (i + 1) as f32
+                        };
+                        window.paint_quad(fill(
+                            Bounds::new(point(x, bounds.origin.y), size(band_w, bounds.size.height)),
+                            overscroll_glow_color.opacity(alpha),
+                        ));
+                    }
+                    let edge_w = px(1.5);
+                    let edge_x = if overscroll_x > 0.0 {
+                        bounds.origin.x
+                    } else {
+                        bounds.origin.x + bounds.size.width - edge_w
+                    };
+                    window.paint_quad(fill(
+                        Bounds::new(
+                            point(edge_x, bounds.origin.y),
+                            size(edge_w, bounds.size.height),
+                        ),
+                        overscroll_glow_color.opacity(0.42 * ratio),
                     ));
                 }
             });

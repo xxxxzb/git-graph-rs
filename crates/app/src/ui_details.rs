@@ -7,6 +7,9 @@ use ely_core::data_display::{BeforeAfter, DescriptionList};
 use ely_core::feedback::{EmptyState, ErrorView};
 use ely_core::layout::SplitPane;
 use ely_core::lists::GitStatus;
+use ely_core::motion::{
+    BASE, NUDGE, Shimmer, SkeletonTable, SkeletonText, duration, ease_out_cubic,
+};
 use ely_core::primitives::{IconName, Image};
 use ely_core::theme::{ActiveTheme, ControlSize, Radius, TextSize};
 use ely_core::typography::{SelectableText, format};
@@ -14,8 +17,9 @@ use ely_git::{DiffLayout, DiffStat, DiffViewer, GitStatusBadge};
 use git_graph_core::status::ScmChange;
 use git_graph_core::types::{GitCommitDetails, GitFileChange, GitFileStatus, UNCOMMITTED};
 use gpui::{
-    AnyElement, App, Axis, Context, FontWeight, InteractiveElement, IntoElement, ObjectFit,
-    ParentElement, SharedString, StatefulInteractiveElement, Styled, div, prelude::*, px,
+    Animation, AnimationExt, AnyElement, App, Axis, Context, FontWeight, InteractiveElement,
+    IntoElement, ObjectFit, ParentElement, SharedString, StatefulInteractiveElement, Styled, div,
+    prelude::*, px,
 };
 
 use crate::app_view::GitGraphApp;
@@ -32,22 +36,43 @@ pub fn render_details_pane(
     let colors = theme.colors.clone();
     let weak = cx.weak_entity();
 
-    let Some(selected_hash) = &tab.selected_hash else {
-        return div()
-            .size_full()
-            .bg(colors.surface)
-            .flex()
-            .items_center()
-            .justify_center()
-            .child(
-                EmptyState::new(
-                    "details-none-selected",
-                    IconName::GitCommitHorizontal,
-                    "选择一个提交以查看详情与文件变更",
+    let anim_duration = duration(BASE, cx);
+    let wrap_transition = |content: gpui::Div| -> AnyElement {
+        if app.details_open_serial == 0 {
+            content.into_any_element()
+        } else {
+            content
+                .with_animation(
+                    (
+                        "details-transition",
+                        tab.id
+                            .wrapping_mul(10_007)
+                            .wrapping_add(app.details_open_serial),
+                    ),
+                    Animation::new(anim_duration).with_easing(ease_out_cubic),
+                    |el, t| el.opacity(t).pt(NUDGE * 2.0 * (1.0 - t)),
                 )
-                .body("点击上方图谱中的任意提交行或「未提交的更改」行。"),
-            )
-            .into_any_element();
+                .into_any_element()
+        }
+    };
+
+    let Some(selected_hash) = &tab.selected_hash else {
+        return wrap_transition(
+            div()
+                .size_full()
+                .bg(colors.surface)
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    EmptyState::new(
+                        "details-none-selected",
+                        IconName::GitCommitHorizontal,
+                        "选择一个提交以查看详情与文件变更",
+                    )
+                    .body("点击上方图谱中的任意提交行或「未提交的更改」行。"),
+                ),
+        );
     };
 
     let left_pane = render_left_pane(tab, selected_hash, cx);
@@ -55,10 +80,8 @@ pub fn render_details_pane(
 
     let split_sizes = app.persisted.horizontal_split;
 
-    div()
-        .size_full()
-        .bg(colors.surface)
-        .child(
+    wrap_transition(
+        div().size_full().bg(colors.surface).child(
             SplitPane::new("details-h-split", Axis::Horizontal, px(240.0))
                 .pane(left_pane)
                 .pane(right_pane)
@@ -72,8 +95,8 @@ pub fn render_details_pane(
                         .ok();
                     }
                 }),
-        )
-        .into_any_element()
+        ),
+    )
 }
 
 fn render_left_pane(
@@ -87,14 +110,43 @@ fn render_left_pane(
         return render_uncommitted_left(tab, cx);
     }
 
+    if tab.loading_details && tab.details.is_none() {
+        return div()
+            .size_full()
+            .p_3()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .overflow_hidden()
+            .child(
+                Shimmer::new(("detail-meta-shimmer", tab.id))
+                    .child(SkeletonText::new("detail-meta-skel", 4)),
+            )
+            .child(div().border_t_1().border_color(colors.border))
+            .child(
+                Shimmer::new(("detail-files-shimmer", tab.id))
+                    .child(SkeletonTable::new("detail-files-skel", 4, 2)),
+            )
+            .into_any_element();
+    }
+
     match &tab.details {
         None => div()
             .size_full()
+            .p_3()
             .flex()
-            .items_center()
-            .justify_center()
-            .text_color(colors.fg_muted)
-            .child("正在读取提交详情…")
+            .flex_col()
+            .gap_4()
+            .overflow_hidden()
+            .child(
+                Shimmer::new(("detail-meta-shimmer", tab.id))
+                    .child(SkeletonText::new("detail-meta-skel", 4)),
+            )
+            .child(div().border_t_1().border_color(colors.border))
+            .child(
+                Shimmer::new(("detail-files-shimmer", tab.id))
+                    .child(SkeletonTable::new("detail-files-skel", 4, 2)),
+            )
             .into_any_element(),
         Some(Err(err)) => ErrorView::new("commit-detail-err", IconName::TriangleAlert, "无法读取提交详情")
             .detail(err.clone())
@@ -591,6 +643,18 @@ fn render_right_pane(
     let weak = cx.weak_entity();
 
     let Some(selected_file) = &tab.selected_file else {
+        if tab.loading_details {
+            return div()
+                .size_full()
+                .bg(colors.bg)
+                .p_4()
+                .overflow_hidden()
+                .child(
+                    Shimmer::new(("detail-diff-shimmer", tab.id))
+                        .child(SkeletonText::new("detail-diff-skel", 8)),
+                )
+                .into_any_element();
+        }
         return EmptyState::new(
             "diff-no-file",
             IconName::FileText,
@@ -675,11 +739,12 @@ fn render_right_pane(
     let body: AnyElement = match &tab.file_view {
         None => div()
             .size_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .text_color(colors.fg_muted)
-            .child("正在加载文件 Diff…")
+            .p_4()
+            .overflow_hidden()
+            .child(
+                Shimmer::new(("detail-diff-shimmer", tab.id))
+                    .child(SkeletonText::new("detail-diff-skel", 8)),
+            )
             .into_any_element(),
         Some(Err(err)) => ErrorView::new("diff-load-err", IconName::TriangleAlert, "无法读取文件差异")
             .detail(err.clone())

@@ -8,7 +8,10 @@ use ely_core::buttons::{Button, ButtonVariant, IconButton};
 use ely_core::data_display::{Badge, Tone};
 use ely_core::feedback::{EmptyState, ErrorView};
 use ely_core::forms::{Checkbox, Choice, SearchInput, Select};
-use ely_core::motion::{Spinner, SpinnerStyle};
+use ely_core::motion::{
+    Refresh, RefreshIndicator, Shimmer, SkeletonTable, Spinner, SpinnerStyle, duration,
+    ease_out_cubic,
+};
 use ely_core::primitives::{Icon, IconName};
 use ely_core::shell::{Toolbar, ToolbarGroup, ToolbarSeparator};
 use ely_core::theme::{ActiveTheme, ControlSize, IconSize, Radius, TextSize};
@@ -16,10 +19,10 @@ use git_graph_core::types::{GitCommit, UNCOMMITTED};
 use git_graph_layout::{RefBadge, RowLayout, group_ref_badges};
 use git_graph_ops::BranchSyncStatus;
 use gpui::{
-    AnyElement, App, Context, CursorStyle, DragMoveEvent, EmptyView, FontWeight, Hsla,
-    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, ParentElement, Pixels, ScrollEvent,
-    SharedString, StatefulInteractiveElement, Styled, TouchPhase, div, prelude::*, px,
-    uniform_list,
+    Animation, AnimationExt, AnyElement, App, Context, CursorStyle, DragMoveEvent, EmptyView,
+    FontWeight, Hsla, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, ParentElement,
+    Pixels, ScrollEvent, SharedString, StatefulInteractiveElement, Styled, TouchPhase, div,
+    prelude::*, px, uniform_list,
 };
 
 use crate::app_view::GitGraphApp;
@@ -588,7 +591,6 @@ pub fn render_graph_table(
     let header = render_table_header(
         graph_col_w,
         graph_scroll_x,
-        max_graph_scroll,
         &widths,
         weak.clone(),
         cx,
@@ -596,13 +598,18 @@ pub fn render_graph_table(
 
     let total_rows = tab.visible_commit_count();
     let show_load_more = tab.more_available && !tab.is_search_active();
-    let item_count = total_rows + usize::from(show_load_more);
+    let show_end_row = !tab.more_available && !tab.is_search_active() && total_rows > 0;
+    let item_count = total_rows + usize::from(show_load_more || show_end_row);
 
     let tab_id = tab.id;
     let dark = theme.is_dark();
     let head_branch = tab.info.as_ref().and_then(|i| i.head.clone());
     let head_hash = tab.head_hash.clone();
     let selected_hash = tab.selected_hash.clone();
+    let overscroll_x = tab.graph_overscroll.offset();
+    let bottom_bounce = tab.bottom_overscroll.offset().abs();
+    let refresh_state = tab.pull_refresh.to_refresh();
+    let flash_commit = tab.flash_commit.clone();
 
     let body: AnyElement = if let Some(err) = &tab.error {
         ErrorView::new("graph-load-error", IconName::TriangleAlert, "图谱加载失败")
@@ -665,14 +672,26 @@ pub fn render_graph_table(
         )
         .body("可以尝试放宽分支、作者或搜索关键词筛选条件。")
         .into_any_element()
+    } else if tab.loading_graph && total_rows == 0 {
+        div()
+            .size_full()
+            .px_4()
+            .py_2()
+            .overflow_hidden()
+            .child(
+                Shimmer::new(("graph-skeleton-shimmer", tab_id))
+                    .child(SkeletonTable::new(("graph-skeleton", tab_id), 12, 5)),
+            )
+            .into_any_element()
     } else {
         // 预先将当前列表的只读快照打包给 uniform_list 闭包使用
         let commits: Rc<Vec<GitCommit>> = Rc::new(tab.visible_commits());
         let rows_layout: Rc<Vec<RowLayout>> = Rc::new(tab.layout.rows.clone());
         let repo_path = tab.path.clone();
         let loading_more = tab.loading_more;
+        let weak_for_list = weak.clone();
 
-        uniform_list(
+        let list = uniform_list(
             ("git-graph-rows", tab_id),
             item_count,
             move |range, _window, cx| {
@@ -680,7 +699,7 @@ pub fn render_graph_table(
                     && !loading_more
                     && range.end + PREFETCH_TAIL >= total_rows
                 {
-                    let weak_more = weak.clone();
+                    let weak_more = weak_for_list.clone();
                     cx.defer(move |cx| {
                         weak_more.update(cx, |this, cx| this.load_more_commits(cx)).ok();
                     });
@@ -693,7 +712,15 @@ pub fn render_graph_table(
                 range
                     .map(|ix| {
                         if ix >= commits.len() {
-                            return render_load_more_row(loading_more, weak.clone(), row_h, cx);
+                            if show_load_more {
+                                return render_load_more_row(
+                                    loading_more,
+                                    weak_for_list.clone(),
+                                    row_h,
+                                    cx,
+                                );
+                            }
+                            return render_end_of_list_row(total_rows, row_h, cx);
                         }
                         let commit = &commits[ix];
                         let row_layout = rows_layout.get(ix).cloned().unwrap_or(RowLayout {
@@ -709,6 +736,9 @@ pub fn render_graph_table(
                         let is_head_commit = head_hash.as_deref() == Some(commit.hash.as_str());
                         let is_uncommitted = commit.hash == UNCOMMITTED;
                         let is_merge = commit.parents.len() > 1 && !is_uncommitted;
+                        let row_flash_serial = flash_commit
+                            .as_ref()
+                            .and_then(|(h, serial)| (h == &commit.hash).then_some(*serial));
 
                         let row_bg = if is_selected {
                             colors.accent.opacity(if dark { 0.18 } else { 0.10 })
@@ -735,6 +765,7 @@ pub fn render_graph_table(
                                 row_height: row_h,
                                 lane_width: px(LANE_WIDTH),
                                 scroll_x: graph_scroll_x,
+                                overscroll_x,
                                 has_overflow_left,
                                 has_overflow_right,
                                 dark,
@@ -743,9 +774,10 @@ pub fn render_graph_table(
                                 stash_color: colors.success,
                                 border_color: colors.border.opacity(0.6),
                                 overflow_hint_color: colors.accent.opacity(0.28),
+                                overscroll_glow_color: colors.accent,
                             },
                         );
-                        let weak_graph_scroll = weak.clone();
+                        let weak_graph_scroll = weak_for_list.clone();
                         let graph_cell = div()
                             .id(("graph-cell", ix))
                             .flex_none()
@@ -757,9 +789,17 @@ pub fn render_graph_table(
                                     .unwrap_or(ScrollAxisDecision::Neutral);
                                 if let ScrollAxisDecision::Horizontal(dx) = decision {
                                     cx.stop_propagation();
-                                    if max_graph_scroll > 0.0 && dx.abs() > 0.01 {
+                                    let phase = event.touch_phase;
+                                    if dx.abs() > 0.01
+                                        || matches!(
+                                            phase,
+                                            TouchPhase::Ended | TouchPhase::Cancelled
+                                        )
+                                    {
                                         weak_graph_scroll
-                                            .update(cx, |this, cx| this.scroll_graph_x(dx, cx))
+                                            .update(cx, |this, cx| {
+                                                this.handle_graph_horizontal_scroll(dx, phase, cx);
+                                            })
                                             .ok();
                                     }
                                 }
@@ -776,7 +816,7 @@ pub fn render_graph_table(
                             is_merge,
                             is_head_commit,
                             &repo_path,
-                            &weak,
+                            &weak_for_list,
                             cx,
                         );
 
@@ -796,19 +836,29 @@ pub fn render_graph_table(
                             short_hash(&commit.hash).to_string()
                         };
 
-                        let weak_click = weak.clone();
-                        let weak_ctx = weak.clone();
+                        let weak_click = weak_for_list.clone();
+                        let weak_ctx = weak_for_list.clone();
                         let commit_for_click = commit.clone();
                         let commit_for_ctx = commit.clone();
                         let repo_for_ctx = repo_path.clone();
 
-                        div()
+                        // 闪动定位行若本身为纯不透明背景，改为透明以透出外层 Flash 高亮淡出效果
+                        let inner_bg = if row_flash_serial.is_some()
+                            && !is_selected
+                            && ix % 2 == 0
+                        {
+                            gpui::transparent_black()
+                        } else {
+                            row_bg
+                        };
+
+                        let row_el = div()
                             .id(("graph-row", ix))
                             .w_full()
                             .h(row_h)
                             .flex()
                             .items_center()
-                            .bg(row_bg)
+                            .bg(inner_bg)
                             .when(!is_selected, |r| {
                                 r.hover(|s| s.bg(colors.hover))
                             })
@@ -874,15 +924,88 @@ pub fn render_graph_table(
                                     .overflow_hidden()
                                     .whitespace_nowrap()
                                     .child(hash_text),
-                            )
-                            .into_any_element()
+                            );
+
+                        // 仅为匹配 flash_commit 的单行叠加顶层淡出高亮层（首次挂载即刻触发且不被行背景遮挡）
+                        if let Some(serial) = row_flash_serial {
+                            let flash_color = colors.accent;
+                            let peak_alpha = if dark { 0.34 } else { 0.22 };
+                            let flash_dur = duration(Duration::from_millis(900), cx);
+                            row_el
+                                .relative()
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .inset_0()
+                                        .with_animation(
+                                            ("commit-flash-overlay", serial as usize),
+                                            Animation::new(flash_dur).with_easing(ease_out_cubic),
+                                            move |overlay, t| {
+                                                let alpha = peak_alpha * (1.0 - t).max(0.0);
+                                                overlay.bg(flash_color.opacity(alpha))
+                                            },
+                                        ),
+                                )
+                                .into_any_element()
+                        } else {
+                            row_el.into_any_element()
+                        }
                     })
                     .collect()
             },
         )
         .track_scroll(&tab.graph_scroll)
-        .size_full()
-        .into_any_element()
+        .size_full();
+
+        let is_pull_idle = refresh_state == Refresh::Idle;
+        let bottom_ratio = (bottom_bounce / 20.0).clamp(0.0, 1.0);
+        let weak_list_scroll = weak.clone();
+
+        div()
+            .id(("graph-list-scroll-wrap", tab_id))
+            .relative()
+            .size_full()
+            .overflow_hidden()
+            .flex()
+            .flex_col()
+            .on_scroll(move |event: &ScrollEvent, _, cx| {
+                weak_list_scroll
+                    .update(cx, |this, cx| {
+                        this.handle_graph_list_vertical_scroll(event, cx);
+                    })
+                    .ok();
+            })
+            .child(
+                div()
+                    .w_full()
+                    .flex_none()
+                    .when(!is_pull_idle, |el| {
+                        el.bg(colors.surface.opacity(0.65))
+                            .border_b_1()
+                            .border_color(colors.border.opacity(0.6))
+                    })
+                    .child(RefreshIndicator::new(
+                        ("graph-pull-refresh", tab_id),
+                        refresh_state,
+                    )),
+            )
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .size_full()
+                            .when(bottom_bounce > 0.2, |el| el.pb(px(bottom_bounce * 0.65)))
+                            .child(list),
+                    )
+                    .when(bottom_ratio > 0.01, |el| {
+                        el.child(render_bottom_overscroll_glow(bottom_ratio, colors.accent))
+                    }),
+            )
+            .into_any_element()
     };
 
     div()
@@ -892,6 +1015,50 @@ pub fn render_graph_table(
         .bg(colors.bg)
         .child(header)
         .child(div().flex_1().min_h_0().child(body))
+        .into_any_element()
+}
+
+fn render_bottom_overscroll_glow(ratio: f32, accent: Hsla) -> AnyElement {
+    let glow_h = px(4.0 + 18.0 * ratio);
+    div()
+        .absolute()
+        .bottom_0()
+        .left_0()
+        .right_0()
+        .h(glow_h)
+        .flex()
+        .flex_col()
+        .justify_end()
+        .child(
+            div()
+                .w_full()
+                .h(glow_h * 0.5)
+                .bg(accent.opacity(0.06 * ratio)),
+        )
+        .child(
+            div()
+                .w_full()
+                .h(glow_h * 0.5)
+                .bg(accent.opacity(0.16 * ratio)),
+        )
+        .into_any_element()
+}
+
+fn render_end_of_list_row(total_rows: usize, row_h: Pixels, cx: &App) -> AnyElement {
+    let theme = cx.theme();
+    div()
+        .id("graph-end-of-list-row")
+        .w_full()
+        .h(row_h)
+        .flex()
+        .items_center()
+        .justify_center()
+        .gap_2()
+        .text_size(theme.text_size(TextSize::Xs))
+        .text_color(theme.colors.fg_subtle)
+        .child(div().w(px(28.0)).h_px().bg(theme.colors.border.opacity(0.6)))
+        .child(format!("已到底部 · 共 {total_rows} 条提交"))
+        .child(div().w(px(28.0)).h_px().bg(theme.colors.border.opacity(0.6)))
         .into_any_element()
 }
 
@@ -927,7 +1094,6 @@ fn render_load_more_row(
 fn render_table_header(
     graph_col_w: f32,
     graph_scroll_x: f32,
-    max_graph_scroll: f32,
     widths: &ColumnWidths,
     weak: gpui::WeakEntity<GitGraphApp>,
     cx: &App,
@@ -998,9 +1164,14 @@ fn render_table_header(
                 .unwrap_or(ScrollAxisDecision::Neutral);
             if let ScrollAxisDecision::Horizontal(dx) = decision {
                 cx.stop_propagation();
-                if max_graph_scroll > 0.0 && dx.abs() > 0.01 {
+                let phase = event.touch_phase;
+                if dx.abs() > 0.01
+                    || matches!(phase, TouchPhase::Ended | TouchPhase::Cancelled)
+                {
                     weak_header_scroll
-                        .update(cx, |this, cx| this.scroll_graph_x(dx, cx))
+                        .update(cx, |this, cx| {
+                            this.handle_graph_horizontal_scroll(dx, phase, cx);
+                        })
                         .ok();
                 }
             }

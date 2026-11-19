@@ -22,6 +22,10 @@
 
 它采用 **「`gix` 内存直读 + `git` CLI 安全写入 + GPUI Metal 原生渲染」** 架构：所有仓库读取（分支、Tag、提交历史、提交详情、文件 Diff、全历史搜索、工作区状态）均通过常驻内存的纯 Rust `gix` 引擎在进程内完成；所有写入操作均安全路由至系统 `git` CLI，并内置防数据丢失守卫。整个 Release `.app` 应用包仅约 **28 MB**。
 
+<p align="center">
+  <img src="assets/screenshot-light.jpg" width="100%" alt="Git Graph RS 界面预览" />
+</p>
+
 ## 核心特性
 
 - **极速只读引擎**：复用并升级 `git-graph-core` 至 `gix 0.90`，常驻热仓库句柄池，无需反复拉起 `git` 子进程即可毫秒级加载提交图谱、提交详情与文件 Diff。

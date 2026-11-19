@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 
 use git_graph_core::api::GraphOptions;
 use git_graph_core::types::{CommitOrdering, GitCommit, UNCOMMITTED};
-use git_graph_layout::{CommitNode, RefKind, RefLabel};
+use git_graph_layout::{
+    CommitNode, GraphLayout, NodeKind, RefKind, RefLabel, RowLayout,
+};
 use gpui::ImageFormat;
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
@@ -193,6 +195,53 @@ pub fn matches_commit_query(commit: &GitCommit, needle_lower: &str) -> bool {
             .remotes
             .iter()
             .any(|r| r.name.to_lowercase().contains(needle_lower))
+}
+
+/// 判断提交是否符合顶部「作者」筛选条件（大小写不敏感精确匹配作者名）。
+pub fn matches_author_filter(commit: &GitCommit, author_filter: Option<&str>) -> bool {
+    let Some(author) = author_filter else {
+        return true;
+    };
+    if commit.hash == UNCOMMITTED {
+        return false;
+    }
+    commit.author.to_lowercase() == author.to_lowercase()
+}
+
+/// 为跨页搜索结果计算干净的单节点列表布局（不绘制跨页错乱连线）。
+pub fn compute_search_layout(commits: &[CommitNode], head_hash: Option<&str>) -> GraphLayout {
+    let rows = commits
+        .iter()
+        .map(|node| {
+            let is_head = head_hash.is_some_and(|head| head == node.hash);
+            let is_merge = !node.is_uncommitted && node.parents.len() > 1;
+            let node_kind = if node.is_uncommitted {
+                NodeKind::Uncommitted
+            } else if node.is_stash {
+                NodeKind::Stash
+            } else if is_head {
+                NodeKind::Head
+            } else if is_merge {
+                NodeKind::Merge
+            } else {
+                NodeKind::Normal
+            };
+            RowLayout {
+                lane: 0,
+                color_index: 0,
+                node_kind,
+                is_head,
+                is_merge,
+                active_lanes: 1,
+                segments: Vec::new(),
+            }
+        })
+        .collect();
+
+    GraphLayout {
+        rows,
+        max_lanes: usize::from(!commits.is_empty()),
+    }
 }
 
 /// 将 `GitCommit` 转换为图谱布局所需的 `CommitNode`。
@@ -410,5 +459,31 @@ mod tests {
         assert_eq!(image_format_for_path("assets/logo.PNG"), Some(ImageFormat::Png));
         assert_eq!(image_format_for_path("a/b/photo.jpeg"), Some(ImageFormat::Jpeg));
         assert_eq!(image_format_for_path("src/main.rs"), None);
+    }
+
+    #[test]
+    fn search_layout_and_author_filter_behave_cleanly() {
+        let head = make_commit("aaaa1111", "Alice", "Head commit", vec!["main"]);
+        let mut merge = make_commit("bbbb2222", "Bob", "Merge branch", vec![]);
+        merge.parents = vec!["p1".to_string(), "p2".to_string()];
+        let uncommitted = make_commit(UNCOMMITTED, "*", "Uncommitted", vec![]);
+
+        let nodes = vec![
+            commit_to_node(&uncommitted),
+            commit_to_node(&head),
+            commit_to_node(&merge),
+        ];
+        let layout = compute_search_layout(&nodes, Some("aaaa1111"));
+        assert_eq!(layout.max_lanes, 1);
+        assert_eq!(layout.rows.len(), 3);
+        assert!(layout.rows.iter().all(|r| r.segments.is_empty() && r.lane == 0));
+        assert_eq!(layout.rows[0].node_kind, NodeKind::Uncommitted);
+        assert_eq!(layout.rows[1].node_kind, NodeKind::Head);
+        assert_eq!(layout.rows[2].node_kind, NodeKind::Merge);
+
+        assert!(matches_author_filter(&head, None));
+        assert!(matches_author_filter(&head, Some("alice")));
+        assert!(!matches_author_filter(&head, Some("Bob")));
+        assert!(!matches_author_filter(&uncommitted, Some("Alice")));
     }
 }

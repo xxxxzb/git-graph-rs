@@ -4,7 +4,10 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use ely_core::buttons::{Button, ButtonVariant, IconButton};
+use ely_core::data_display::{Badge, Tone};
+use ely_core::feedback::{EmptyState, ErrorView};
 use ely_core::forms::{Checkbox, Choice, SearchInput, Select};
+use ely_core::motion::{Spinner, SpinnerStyle};
 use ely_core::primitives::{Icon, IconName};
 use ely_core::shell::{Toolbar, ToolbarGroup, ToolbarSeparator};
 use ely_core::theme::{ActiveTheme, ControlSize, IconSize, Radius, TextSize};
@@ -12,8 +15,8 @@ use git_graph_core::types::{GitCommit, UNCOMMITTED};
 use git_graph_layout::{RefBadge, RowLayout, group_ref_badges};
 use gpui::{
     AnyElement, App, Context, CursorStyle, DragMoveEvent, EmptyView, FontWeight, Hsla,
-    InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, SharedString,
-    StatefulInteractiveElement, Styled, div, prelude::*, px, uniform_list,
+    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, ParentElement, Pixels,
+    SharedString, StatefulInteractiveElement, Styled, div, prelude::*, px, uniform_list,
 };
 
 use crate::app_view::GitGraphApp;
@@ -130,10 +133,76 @@ pub fn render_filter_toolbar(
             }
         });
 
-    // 搜索框
-    let search_box = div().w(px(220.0)).child(
-        SearchInput::new("graph-search", &app.search_input).size(ControlSize::Sm),
-    );
+    // 搜索框（支持 Esc 一键清空搜索）
+    let search_box = div()
+        .w(px(236.0))
+        .on_key_down({
+            let weak = weak.clone();
+            move |event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key == "escape"
+                    && !event.keystroke.modifiers.platform
+                    && !event.keystroke.modifiers.control
+                    && !event.keystroke.modifiers.alt
+                {
+                    weak.update(cx, |this, cx| {
+                        if !this.search_input.read(cx).is_empty()
+                            || this.active_tab().is_some_and(|t| t.is_search_active())
+                        {
+                            this.clear_search(cx);
+                        } else {
+                            window.focus(&this.focus, cx);
+                        }
+                    })
+                    .ok();
+                    cx.stop_propagation();
+                }
+            }
+        })
+        .child(SearchInput::new("graph-search", &app.search_input).size(ControlSize::Sm));
+
+    let search_status: Option<AnyElement> = tab.is_search_active().then(|| {
+        if tab.search_loading {
+            div()
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .px_1()
+                .child(
+                    Spinner::new(("search-spinner", tab.id))
+                        .style(SpinnerStyle::Dots)
+                        .size(IconSize::Xs)
+                        .color(colors.accent),
+                )
+                .child(
+                    div()
+                        .text_size(theme.text_size(TextSize::Xs))
+                        .text_color(colors.fg_muted)
+                        .child("全历史检索中…"),
+                )
+                .into_any_element()
+        } else if tab.search_error.is_some() {
+            Badge::new("检索失败")
+                .tone(Tone::Danger)
+                .into_any_element()
+        } else if let Some(count) = tab.search_match_count {
+            let count_badge = if count == 0 {
+                Badge::new("全历史 0 条").tone(Tone::Warning)
+            } else {
+                Badge::new(format!("全历史 {count} 条")).tone(Tone::Info)
+            };
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(count_badge)
+                .when(tab.search_used_literal_fallback, |el| {
+                    el.child(Badge::new("字面量匹配").tone(Tone::Neutral))
+                })
+                .into_any_element()
+        } else {
+            div().into_any_element()
+        }
+    });
 
     // 右侧动作按钮
     let jump_head_btn = IconButton::new("jump-head-btn", IconName::GitCommitHorizontal)
@@ -208,7 +277,8 @@ pub fn render_filter_toolbar(
                         .child(div().w(px(142.0)).child(author_select))
                         .child(div().px_1().child(remote_check))
                         .child(ToolbarSeparator)
-                        .child(search_box),
+                        .child(search_box)
+                        .children(search_status),
                 )
                 .child(
                     ToolbarGroup::new()
@@ -235,8 +305,8 @@ pub fn render_graph_table(
 
     let header = render_table_header(&widths, weak.clone(), cx);
 
-    let total_rows = tab.filtered_indices.len();
-    let show_load_more = tab.more_available && tab.filter.search_query.trim().is_empty();
+    let total_rows = tab.visible_commit_count();
+    let show_load_more = tab.more_available && !tab.is_search_active();
     let item_count = total_rows + usize::from(show_load_more);
 
     let tab_id = tab.id;
@@ -246,11 +316,60 @@ pub fn render_graph_table(
     let selected_hash = tab.selected_hash.clone();
 
     let body: AnyElement = if let Some(err) = &tab.error {
-        ely_core::feedback::ErrorView::new("graph-load-error", IconName::TriangleAlert, "图谱加载失败")
+        ErrorView::new("graph-load-error", IconName::TriangleAlert, "图谱加载失败")
             .detail(err.clone())
             .into_any_element()
+    } else if tab.is_search_active() && tab.search_loading && total_rows == 0 {
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .child(
+                Spinner::new(("graph-search-loading", tab_id))
+                    .style(SpinnerStyle::Ring)
+                    .size(IconSize::Md)
+                    .color(colors.accent),
+            )
+            .child(
+                div()
+                    .text_size(theme.text_size(TextSize::Sm))
+                    .text_color(colors.fg_muted)
+                    .child("正在全历史检索提交记录…"),
+            )
+            .into_any_element()
+    } else if tab.is_search_active() && !tab.search_loading && total_rows == 0 {
+        if let Some(search_err) = &tab.search_error {
+            ErrorView::new(
+                "graph-search-error",
+                IconName::TriangleAlert,
+                "全历史搜索失败",
+            )
+            .detail(search_err.clone())
+            .into_any_element()
+        } else {
+            let weak_clear = weak.clone();
+            EmptyState::new("graph-search-empty", IconName::Search, "未找到匹配的提交记录")
+                .body(format!(
+                    "全历史中没有提交匹配「{}」。支持正则表达式、Commit Body、作者、分支/Tag 或 4+ 位 Hash。",
+                    tab.filter.search_query.trim()
+                ))
+                .action(
+                    Button::new("clear-search-empty-btn", "清空搜索 (Esc)")
+                        .variant(ButtonVariant::Secondary)
+                        .size(ControlSize::Sm)
+                        .on_click(move |_, _, cx| {
+                            weak_clear
+                                .update(cx, |this, cx| this.clear_search(cx))
+                                .ok();
+                        }),
+                )
+                .into_any_element()
+        }
     } else if total_rows == 0 && !tab.loading_graph {
-        ely_core::feedback::EmptyState::new(
+        EmptyState::new(
             "graph-empty",
             IconName::GitCommitHorizontal,
             "没有匹配的提交记录",
@@ -259,12 +378,7 @@ pub fn render_graph_table(
         .into_any_element()
     } else {
         // 预先将当前列表的只读快照打包给 uniform_list 闭包使用
-        let commits: Rc<Vec<GitCommit>> = Rc::new(
-            tab.filtered_indices
-                .iter()
-                .filter_map(|&idx| tab.all_commits.get(idx).cloned())
-                .collect(),
-        );
+        let commits: Rc<Vec<GitCommit>> = Rc::new(tab.visible_commits());
         let rows_layout: Rc<Vec<RowLayout>> = Rc::new(tab.layout.rows.clone());
         let repo_path = tab.path.clone();
         let loading_more = tab.loading_more;

@@ -30,8 +30,8 @@ use crate::modals::{
     ActiveModal, ContextMenuState, PendingWriteOp, build_commit_context_menu, render_active_modal,
 };
 use crate::repo_tab::{
-    FileSection, RepoTabState, SelectedFile, load_commit_details, load_file_diff,
-    load_file_line_counts, load_repo_snapshot,
+    FileSection, RepoTabState, SelectedFile, execute_history_search, load_commit_details,
+    load_file_diff, load_file_line_counts, load_repo_snapshot,
 };
 use crate::state::{
     PersistedState, repo_display_name, save_persisted_state, short_hash,
@@ -41,7 +41,15 @@ use crate::ui_graph::{ResizeCol, render_filter_toolbar, render_graph_table};
 
 gpui::actions!(
     git_graph_app,
-    [OpenRepository, CloseActiveTab, RefreshGraph, ToggleTheme, ToggleDetails, QuitApp]
+    [
+        OpenRepository,
+        CloseActiveTab,
+        RefreshGraph,
+        ToggleTheme,
+        ToggleDetails,
+        FocusSearch,
+        QuitApp
+    ]
 );
 
 pub struct GitGraphApp {
@@ -358,6 +366,7 @@ impl GitGraphApp {
                         tab.scm_changes = snap.scm_changes;
                         tab.uncommitted_count = snap.uncommitted_count;
                         tab.recompute_visible_rows();
+                        let should_research = !soft && tab.is_search_active();
 
                         // 软刷新时若之前选中了某提交或未提交行，同步刷新详情与 diff
                         if let Some(sel) = tab.selected_hash.clone() {
@@ -371,6 +380,10 @@ impl GitGraphApp {
                                 tab.selected_file = None;
                                 tab.file_view = None;
                             }
+                        }
+
+                        if should_research {
+                            this.trigger_history_search(tab_id, Duration::ZERO, cx);
                         }
                     }
                     Err(err) => {
@@ -591,8 +604,14 @@ impl GitGraphApp {
         let engine = tab.engine.clone();
         let stash = tab.selected_stash();
         let first_parent = tab
-            .find_commit(&hash)
-            .and_then(|c| c.parents.first().cloned());
+            .details
+            .as_ref()
+            .and_then(|res| res.as_ref().ok())
+            .and_then(|d| d.parents.first().cloned())
+            .or_else(|| {
+                tab.find_commit(&hash)
+                    .and_then(|c| c.parents.first().cloned())
+            });
         let file_change = tab
             .details
             .as_ref()
@@ -657,6 +676,13 @@ impl GitGraphApp {
             return;
         }
         tab.filter.author = author;
+        if tab.is_search_active() {
+            tab.search_serial += 1;
+            tab.search_loading = true;
+            tab.search_results = None;
+            tab.search_match_count = None;
+            tab.search_error = None;
+        }
         let id = tab.id;
         self.load_tab_graph(id, false, cx);
     }
@@ -681,8 +707,121 @@ impl GitGraphApp {
             return;
         }
         tab.filter.search_query = query;
+        let tab_id = tab.id;
+
+        if !tab.is_search_active() {
+            tab.search_serial += 1;
+            tab.clear_search_state();
+            cx.notify();
+            return;
+        }
+
+        tab.search_results = None;
+        tab.search_error = None;
+        tab.search_match_count = None;
+        tab.search_used_literal_fallback = false;
         tab.recompute_visible_rows();
+        self.trigger_history_search(tab_id, Duration::from_millis(180), cx);
         cx.notify();
+    }
+
+    fn trigger_history_search(
+        &mut self,
+        tab_id: u64,
+        debounce: Duration,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tab_by_id_mut(tab_id) else {
+            return;
+        };
+        tab.search_serial += 1;
+        let serial = tab.search_serial;
+        tab.search_loading = true;
+        tab.search_error = None;
+
+        let engine = tab.engine.clone();
+        let query = tab.filter.search_query.clone();
+        let loaded_commits = tab.all_commits.clone();
+        let author_filter = tab.filter.author.clone();
+
+        cx.spawn(async move |weak, cx| {
+            if !debounce.is_zero() {
+                cx.background_executor().timer(debounce).await;
+                let still_current = weak
+                    .update(cx, |this, _| {
+                        this.tab_by_id_mut(tab_id)
+                            .is_some_and(|t| t.search_serial == serial && t.is_search_active())
+                    })
+                    .unwrap_or(false);
+                if !still_current {
+                    return;
+                }
+            }
+
+            let res = cx
+                .background_spawn(async move {
+                    execute_history_search(
+                        &engine,
+                        &query,
+                        &loaded_commits,
+                        author_filter.as_deref(),
+                    )
+                })
+                .await;
+
+            weak.update(cx, |this, cx| {
+                let Some(tab) = this.tab_by_id_mut(tab_id) else {
+                    return;
+                };
+                if tab.search_serial != serial {
+                    return;
+                }
+                tab.search_loading = false;
+                match res {
+                    Ok(output) => {
+                        tab.search_error = None;
+                        tab.search_match_count = Some(output.commits.len());
+                        tab.search_used_literal_fallback = output.used_literal_fallback;
+                        tab.search_results = Some(output.commits);
+                    }
+                    Err(err) => {
+                        tab.search_error = Some(err);
+                        tab.search_match_count = None;
+                        tab.search_used_literal_fallback = false;
+                        tab.search_results = None;
+                    }
+                }
+                tab.recompute_visible_rows();
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active_tab_id.is_none() {
+            return;
+        }
+        let focus = self.search_input.read(cx).focus().clone();
+        window.focus(&focus, cx);
+        self.search_input.update(cx, |input, cx| {
+            let len = input.text().len();
+            if len > 0 {
+                input.select(0..len, cx);
+            }
+        });
+    }
+
+    pub fn clear_search(&mut self, cx: &mut Context<Self>) {
+        let had_text = !self.search_input.read(cx).is_empty();
+        if had_text {
+            self.search_input.update(cx, |input, cx| {
+                input.set_text("", cx);
+            });
+        } else {
+            self.set_search_query(String::new(), cx);
+        }
     }
 
     pub fn jump_to_head(&mut self, cx: &mut Context<Self>) {
@@ -1700,8 +1839,15 @@ impl GitGraphApp {
                 ))
                 .left(StatusBarItem::new("status-path").label(tab.path.display().to_string()))
                 .right(
-                    StatusBarItem::new("status-count")
-                        .label(format!("{} 条提交", tab.filtered_indices.len())),
+                    StatusBarItem::new("status-count").label(if tab.is_search_active() {
+                        if tab.search_loading {
+                            "全历史检索中…".to_string()
+                        } else {
+                            format!("命中 {} 条提交", tab.visible_commit_count())
+                        }
+                    } else {
+                        format!("{} 条提交", tab.visible_commit_count())
+                    }),
                 );
         }
         bar.right(StatusBarItem::new("status-engine").label("Engine: gix (in-process)"))
@@ -1742,6 +1888,9 @@ impl Render for GitGraphApp {
             }))
             .on_action(cx.listener(|this, _: &ToggleDetails, _, cx| {
                 this.toggle_details_pane(cx);
+            }))
+            .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
+                this.focus_search(window, cx);
             }))
             .child(self.render_titlebar(window, cx))
             .child(self.render_workspace_body(cx))

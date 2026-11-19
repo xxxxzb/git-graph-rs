@@ -19,7 +19,8 @@ use gpui::{
 };
 
 use crate::app_view::{
-    CloseActiveTab, GitGraphApp, OpenRepository, QuitApp, RefreshGraph, ToggleDetails, ToggleTheme,
+    CloseActiveTab, FocusSearch, GitGraphApp, OpenRepository, QuitApp, RefreshGraph, ToggleDetails,
+    ToggleTheme,
 };
 use crate::state::load_persisted_state;
 
@@ -41,6 +42,7 @@ fn app_menus() -> Vec<Menu> {
         Menu {
             name: "视图".into(),
             items: vec![
+                MenuItem::action("搜索历史提交…", FocusSearch),
                 MenuItem::action("刷新图谱", RefreshGraph),
                 MenuItem::action("显示 / 隐藏详情分栏", ToggleDetails),
                 MenuItem::separator(),
@@ -81,6 +83,7 @@ fn launch(initial_repos: Vec<PathBuf>, cx: &mut App) -> Result<()> {
         KeyBinding::new("cmd-w", CloseActiveTab, Some("GitGraphApp")),
         KeyBinding::new("cmd-r", RefreshGraph, Some("GitGraphApp")),
         KeyBinding::new("cmd-j", ToggleDetails, Some("GitGraphApp")),
+        KeyBinding::new("cmd-f", FocusSearch, Some("GitGraphApp")),
     ]);
     cx.on_action(|_: &QuitApp, cx| cx.quit());
     cx.set_menus(app_menus());

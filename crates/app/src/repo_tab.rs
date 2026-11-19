@@ -1,6 +1,6 @@
 //! 单个打开的本地仓库 Tab 状态模型及后台异步加载任务。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -10,14 +10,15 @@ use git_graph_core::types::{
     GitAuthor, GitCommit, GitCommitDetails, GitCommitStash, GitFileChange, GitLineCounts,
     GitRepoInfo, UNCOMMITTED,
 };
-use git_graph_core::{details, diff, status};
+use git_graph_core::{ErrorKind, details, diff, status};
 use git_graph_layout::{GraphLayout, compute_layout};
 use git_graph_ops::RepoWatcher;
 use gpui::{Image, Task, UniformListScrollHandle};
 
 use crate::diff_parser::{ParsedDiff, parse_unified_diff, stretches_from_texts};
 use crate::state::{
-    FilterCriteria, commit_to_node, filter_commit_indices, image_format_for_path, repo_display_name,
+    FilterCriteria, commit_to_node, compute_search_layout, filter_commit_indices,
+    image_format_for_path, matches_author_filter, matches_commit_query, repo_display_name,
 };
 
 /// 详情面板当前选中的文件所属分区。
@@ -66,6 +67,13 @@ pub struct RepoSnapshot {
     pub uncommitted_count: usize,
 }
 
+/// 后台全历史搜索输出结果。
+#[derive(Debug, Clone)]
+pub struct HistorySearchOutput {
+    pub commits: Vec<GitCommit>,
+    pub used_literal_fallback: bool,
+}
+
 /// 单个打开的仓库 Tab 全部状态。
 pub struct RepoTabState {
     pub id: u64,
@@ -76,6 +84,7 @@ pub struct RepoTabState {
     pub detail_serial: u64,
     pub line_count_serial: u64,
     pub diff_serial: u64,
+    pub search_serial: u64,
 
     pub info: Option<GitRepoInfo>,
     pub authors: Vec<GitAuthor>,
@@ -87,6 +96,12 @@ pub struct RepoTabState {
     pub filtered_indices: Vec<usize>,
     pub layout: GraphLayout,
     pub uncommitted_count: usize,
+
+    pub search_loading: bool,
+    pub search_results: Option<Vec<GitCommit>>,
+    pub search_error: Option<String>,
+    pub search_match_count: Option<usize>,
+    pub search_used_literal_fallback: bool,
 
     pub selected_hash: Option<String>,
     pub details: Option<Result<GitCommitDetails, String>>,
@@ -121,6 +136,7 @@ impl RepoTabState {
             detail_serial: 0,
             line_count_serial: 0,
             diff_serial: 0,
+            search_serial: 0,
             info: None,
             authors: Vec::new(),
             all_commits: Vec::new(),
@@ -131,6 +147,11 @@ impl RepoTabState {
             filtered_indices: Vec::new(),
             layout: GraphLayout::default(),
             uncommitted_count: 0,
+            search_loading: false,
+            search_results: None,
+            search_error: None,
+            search_match_count: None,
+            search_used_literal_fallback: false,
             selected_hash: None,
             details: None,
             line_counts: BTreeMap::new(),
@@ -149,9 +170,64 @@ impl RepoTabState {
         }
     }
 
+    /// 当前是否处于非空搜索状态。
+    pub fn is_search_active(&self) -> bool {
+        !self.filter.search_query.trim().is_empty()
+    }
+
+    /// 清空全历史搜索状态并恢复常规图谱列表。
+    pub fn clear_search_state(&mut self) {
+        self.search_loading = false;
+        self.search_results = None;
+        self.search_error = None;
+        self.search_match_count = None;
+        self.search_used_literal_fallback = false;
+        self.recompute_visible_rows();
+    }
+
+    /// 当前可见行数量（搜索结果就绪时取 `search_results`，否则取 `filtered_indices`）。
+    pub fn visible_commit_count(&self) -> usize {
+        if self.is_search_active()
+            && let Some(results) = &self.search_results
+        {
+            return results.len();
+        }
+        self.filtered_indices.len()
+    }
+
+    /// 获取当前可见提交列表快照（用于虚拟列表渲染）。
+    pub fn visible_commits(&self) -> Vec<GitCommit> {
+        if self.is_search_active()
+            && let Some(results) = &self.search_results
+        {
+            return results.clone();
+        }
+        self.filtered_indices
+            .iter()
+            .filter_map(|&idx| self.all_commits.get(idx).cloned())
+            .collect()
+    }
+
     /// 应用搜索关键词过滤并重算可见行的泳道布局。
     pub fn recompute_visible_rows(&mut self) {
-        let indices = filter_commit_indices(&self.all_commits, &self.filter.search_query);
+        if self.is_search_active() {
+            if let Some(results) = &self.search_results {
+                let nodes: Vec<_> = results.iter().map(commit_to_node).collect();
+                self.layout = compute_search_layout(&nodes, self.head_hash.as_deref());
+                return;
+            }
+            // 后台全历史搜索尚未返回时，先基于已加载页即时预过滤并采用干净的单节点布局
+            let indices = filter_commit_indices(&self.all_commits, &self.filter.search_query);
+            let nodes: Vec<_> = indices
+                .iter()
+                .filter_map(|&idx| self.all_commits.get(idx).map(commit_to_node))
+                .collect();
+            self.filtered_indices = indices;
+            self.layout = compute_search_layout(&nodes, self.head_hash.as_deref());
+            return;
+        }
+
+        let indices = filter_commit_indices(&self.all_commits, "");
         let nodes: Vec<_> = indices
             .iter()
             .filter_map(|&idx| self.all_commits.get(idx).map(commit_to_node))
@@ -162,14 +238,23 @@ impl RepoTabState {
 
     /// 查找指定 hash 在当前可见行中的索引。
     pub fn visible_index_of(&self, hash: &str) -> Option<usize> {
+        if self.is_search_active()
+            && let Some(results) = &self.search_results
+        {
+            return results.iter().position(|c| c.hash == hash);
+        }
         self.filtered_indices
             .iter()
             .position(|&idx| self.all_commits.get(idx).is_some_and(|c| c.hash == hash))
     }
 
-    /// 通过 hash 查找已加载的 `GitCommit`。
+    /// 通过 hash 查找提交（优先从已加载页查找，若不在则查找全历史搜索结果）。
     pub fn find_commit(&self, hash: &str) -> Option<&GitCommit> {
-        self.all_commits.iter().find(|c| c.hash == hash)
+        self.all_commits.iter().find(|c| c.hash == hash).or_else(|| {
+            self.search_results
+                .as_ref()
+                .and_then(|results| results.iter().find(|c| c.hash == hash))
+        })
     }
 
     /// 当前选中的提交在 `all_commits` 中是否已携带 stash 元信息。
@@ -177,6 +262,150 @@ impl RepoTabState {
         let hash = self.selected_hash.as_deref()?;
         self.find_commit(hash).and_then(|c| c.stash.clone())
     }
+}
+
+fn is_potential_hash(query: &str) -> bool {
+    (4..=40).contains(&query.len()) && query.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn subject_from_body(body: &str) -> String {
+    body.lines()
+        .next()
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn commit_from_details(details: GitCommitDetails) -> GitCommit {
+    let message = subject_from_body(&details.body);
+    GitCommit {
+        hash: details.hash,
+        parents: details.parents,
+        author: details.author,
+        email: details.author_email,
+        date: details.author_date,
+        message,
+        heads: Vec::new(),
+        tags: Vec::new(),
+        remotes: Vec::new(),
+        stash: None,
+    }
+}
+
+/// 在后台线程执行全历史正则搜索、无效正则转义兜底、短 Hash 直达解析、本地匹配融合去重与作者筛选。
+pub fn execute_history_search(
+    engine: &Engine,
+    query: &str,
+    loaded_commits: &[GitCommit],
+    author_filter: Option<&str>,
+) -> Result<HistorySearchOutput, String> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Ok(HistorySearchOutput {
+            commits: Vec::new(),
+            used_literal_fallback: false,
+        });
+    }
+
+    // 1. 全历史正则搜索（非法正则语法自动转义为字面量重试）
+    let mut used_literal_fallback = false;
+    let history_matches = match engine.search_history(trimmed) {
+        Ok(matches) => matches,
+        Err(err) if err.kind == ErrorKind::InvalidArgument => {
+            used_literal_fallback = true;
+            let escaped = regex::escape(trimmed);
+            engine
+                .search_history(&escaped)
+                .map_err(|e| e.to_string())?
+        }
+        Err(err) => return Err(err.to_string()),
+    };
+
+    let loaded_by_hash: HashMap<&str, &GitCommit> = loaded_commits
+        .iter()
+        .map(|c| (c.hash.as_str(), c))
+        .collect();
+
+    let mut seen_hashes = HashSet::new();
+    let mut direct_hit: Option<GitCommit> = None;
+
+    // 2. 4~40 位十六进制短 Hash 全历史直达解析
+    if is_potential_hash(trimmed) {
+        let needle_lower = trimmed.to_ascii_lowercase();
+        let already_matched_hash = history_matches
+            .iter()
+            .any(|m| m.hash.to_ascii_lowercase().starts_with(&needle_lower));
+        if !already_matched_hash && let Ok(details) = engine.commit(trimmed) {
+            let commit = loaded_by_hash
+                .get(details.hash.as_str())
+                .map(|c| (*c).clone())
+                .unwrap_or_else(|| commit_from_details(details));
+            if matches_author_filter(&commit, author_filter) {
+                seen_hashes.insert(commit.hash.clone());
+                direct_hit = Some(commit);
+            }
+        }
+    }
+
+    // 3. 融合全历史命中与已加载页本地匹配（去重并复用已加载页的完整 refs/parents/stash）
+    let mut merged = Vec::new();
+    for m in history_matches {
+        if seen_hashes.contains(&m.hash) {
+            continue;
+        }
+        let commit = loaded_by_hash
+            .get(m.hash.as_str())
+            .map(|c| (*c).clone())
+            .unwrap_or(GitCommit {
+                hash: m.hash,
+                parents: Vec::new(),
+                author: m.author,
+                email: String::new(),
+                date: m.date,
+                message: m.message,
+                heads: Vec::new(),
+                tags: Vec::new(),
+                remotes: Vec::new(),
+                stash: None,
+            });
+        if matches_author_filter(&commit, author_filter) {
+            seen_hashes.insert(commit.hash.clone());
+            merged.push(commit);
+        }
+    }
+
+    let needle_lower = trimmed.to_lowercase();
+    for commit in loaded_commits {
+        if seen_hashes.contains(&commit.hash) {
+            continue;
+        }
+        if matches_commit_query(commit, &needle_lower)
+            && matches_author_filter(commit, author_filter)
+        {
+            seen_hashes.insert(commit.hash.clone());
+            merged.push(commit.clone());
+        }
+    }
+
+    // 未提交更改行置顶，其余提交按提交时间倒序稳定排列
+    merged.sort_by(|a, b| {
+        let a_uncommitted = a.hash == UNCOMMITTED;
+        let b_uncommitted = b.hash == UNCOMMITTED;
+        b_uncommitted
+            .cmp(&a_uncommitted)
+            .then_with(|| b.date.cmp(&a.date))
+    });
+
+    let mut commits = Vec::with_capacity(merged.len() + usize::from(direct_hit.is_some()));
+    if let Some(hit) = direct_hit {
+        commits.push(hit);
+    }
+    commits.extend(merged);
+
+    Ok(HistorySearchOutput {
+        commits,
+        used_literal_fallback,
+    })
 }
 
 /// 在后台线程加载仓库图谱、分支/作者信息与工作区状态。
@@ -463,4 +692,250 @@ fn load_stash_file_diff(
         },
         ParsedDiff::Empty => FileDiffContent::Empty,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::process::Command;
+
+    use git_graph_core::api::GraphOptions;
+    use git_graph_core::types::GitCommitTag;
+
+    use super::*;
+
+    fn git(dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> String {
+        let mut cmd = Command::new("git");
+        cmd.current_dir(dir).args(args);
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().expect("git command should execute");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn init_test_repo() -> (tempfile::TempDir, Engine, Vec<String>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        git(root, &["init", "-b", "main"], &[]);
+        git(root, &["config", "user.name", "Alice"], &[]);
+        git(root, &["config", "user.email", "alice@example.com"], &[]);
+
+        let commits_spec = [
+            (
+                "Alice",
+                "alice@example.com",
+                "2025-01-01T10:00:00Z",
+                "chore: initial bootstrap\n\nDeep body token: legacy-needle-42\nAlso literal [WIP tag and unclosed( pattern",
+            ),
+            (
+                "Bob",
+                "bob@example.com",
+                "2025-01-02T10:00:00Z",
+                "feat: add search engine\n\nBody mentions legacy-needle-42 for Bob",
+            ),
+            (
+                "Alice",
+                "alice@example.com",
+                "2025-01-03T10:00:00Z",
+                "fix(ui): repair toolbar alignment",
+            ),
+            (
+                "Bob",
+                "bob@example.com",
+                "2025-01-04T10:00:00Z",
+                "docs: update readme",
+            ),
+        ];
+
+        let mut hashes = Vec::new();
+        for (idx, (author, email, date, msg)) in commits_spec.iter().enumerate() {
+            std::fs::write(root.join("file.txt"), format!("step {idx}\n")).unwrap();
+            git(root, &["add", "file.txt"], &[]);
+            git(
+                root,
+                &["commit", "-m", msg],
+                &[
+                    ("GIT_AUTHOR_NAME", author),
+                    ("GIT_AUTHOR_EMAIL", email),
+                    ("GIT_COMMITTER_NAME", author),
+                    ("GIT_COMMITTER_EMAIL", email),
+                    ("GIT_AUTHOR_DATE", date),
+                    ("GIT_COMMITTER_DATE", date),
+                ],
+            );
+            hashes.push(git(root, &["rev-parse", "HEAD"], &[]));
+        }
+
+        // 给最新提交打一个 tag，验证已加载提交去重后仍保留完整 refs
+        git(root, &["tag", "v0.9.0", &hashes[2]], &[]);
+
+        let engine = Engine::open(root).expect("open engine");
+        (dir, engine, hashes)
+    }
+
+    #[test]
+    fn history_search_finds_unloaded_commits_including_body() {
+        let (_dir, engine, hashes) = init_test_repo();
+
+        // 只加载最近 2 条到 all_commits（hashes[3], hashes[2]）
+        let loaded = engine
+            .graph(&GraphOptions {
+                max_commits: 2,
+                ..Default::default()
+            })
+            .unwrap()
+            .commits;
+        assert_eq!(loaded.len(), 2);
+        assert!(!loaded.iter().any(|c| c.hash == hashes[0]));
+
+        let out = execute_history_search(&engine, "legacy-needle-42", &loaded, None).unwrap();
+        assert!(!out.used_literal_fallback);
+        let found_hashes: Vec<&str> = out.commits.iter().map(|c| c.hash.as_str()).collect();
+        assert!(found_hashes.contains(&hashes[1].as_str()));
+        assert!(found_hashes.contains(&hashes[0].as_str()));
+        assert_eq!(out.commits.len(), 2);
+    }
+
+    #[test]
+    fn history_search_supports_regex_and_literal_fallback_on_invalid_regex() {
+        let (_dir, engine, hashes) = init_test_repo();
+        let loaded = engine
+            .graph(&GraphOptions {
+                max_commits: 2,
+                ..Default::default()
+            })
+            .unwrap()
+            .commits;
+
+        // 合法正则查询：^feat:|fix\(
+        let regex_out = execute_history_search(&engine, r"^feat:|fix\(", &loaded, None).unwrap();
+        assert!(!regex_out.used_literal_fallback);
+        let regex_hashes: Vec<&str> = regex_out.commits.iter().map(|c| c.hash.as_str()).collect();
+        assert!(regex_hashes.contains(&hashes[2].as_str()));
+        assert!(regex_hashes.contains(&hashes[1].as_str()));
+        assert_eq!(regex_hashes.len(), 2);
+
+        // 非法正则字符（未闭合 [WIP 与 unclosed(）应自动字面量转义兜底
+        let bracket_out = execute_history_search(&engine, "[WIP", &loaded, None).unwrap();
+        assert!(bracket_out.used_literal_fallback);
+        assert_eq!(bracket_out.commits.len(), 1);
+        assert_eq!(bracket_out.commits[0].hash, hashes[0]);
+
+        let paren_out = execute_history_search(&engine, "unclosed(", &loaded, None).unwrap();
+        assert!(paren_out.used_literal_fallback);
+        assert_eq!(paren_out.commits.len(), 1);
+        assert_eq!(paren_out.commits[0].hash, hashes[0]);
+    }
+
+    #[test]
+    fn history_search_resolves_short_hash_and_dedups_preserving_loaded_refs() {
+        let (_dir, engine, hashes) = init_test_repo();
+        let loaded = engine
+            .graph(&GraphOptions {
+                max_commits: 2,
+                ..Default::default()
+            })
+            .unwrap()
+            .commits;
+
+        // 1. 历史深处未加载提交的 7 位短 Hash 直达解析
+        let early_short = &hashes[0][..7];
+        let direct_out = execute_history_search(&engine, early_short, &loaded, None).unwrap();
+        assert_eq!(direct_out.commits.len(), 1);
+        assert_eq!(direct_out.commits[0].hash, hashes[0]);
+        assert!(direct_out.commits[0].message.contains("initial bootstrap"));
+
+        // 2. 已加载提交按 tag 或 message 搜索时保留 refs 且去重
+        let mut loaded_with_tag = loaded.clone();
+        if let Some(c) = loaded_with_tag.iter_mut().find(|c| c.hash == hashes[2])
+            && c.tags.is_empty()
+        {
+            c.tags.push(GitCommitTag {
+                name: "v0.9.0".to_string(),
+                annotated: false,
+            });
+        }
+        let dedup_out = execute_history_search(&engine, "repair toolbar", &loaded_with_tag, None).unwrap();
+        assert_eq!(dedup_out.commits.len(), 1);
+        assert_eq!(dedup_out.commits[0].hash, hashes[2]);
+        assert!(
+            dedup_out.commits[0]
+                .tags
+                .iter()
+                .any(|t| t.name == "v0.9.0")
+        );
+        assert!(!dedup_out.commits[0].parents.is_empty());
+
+        // 3. 本地匹配 ref（v0.9.0 不在 commit message 中，仅在 tag 中）也能融合进结果
+        let tag_out = execute_history_search(&engine, "v0.9.0", &loaded_with_tag, None).unwrap();
+        assert_eq!(tag_out.commits.len(), 1);
+        assert_eq!(tag_out.commits[0].hash, hashes[2]);
+    }
+
+    #[test]
+    fn history_search_respects_author_filter() {
+        let (_dir, engine, hashes) = init_test_repo();
+        let loaded = engine
+            .graph(&GraphOptions {
+                max_commits: 2,
+                ..Default::default()
+            })
+            .unwrap()
+            .commits;
+
+        // "legacy-needle-42" 同时出现在 hashes[0] (Alice) 和 hashes[1] (Bob)
+        let alice_only =
+            execute_history_search(&engine, "legacy-needle-42", &loaded, Some("Alice")).unwrap();
+        assert_eq!(alice_only.commits.len(), 1);
+        assert_eq!(alice_only.commits[0].hash, hashes[0]);
+        assert_eq!(alice_only.commits[0].author, "Alice");
+
+        let bob_only =
+            execute_history_search(&engine, "legacy-needle-42", &loaded, Some("Bob")).unwrap();
+        assert_eq!(bob_only.commits.len(), 1);
+        assert_eq!(bob_only.commits[0].hash, hashes[1]);
+        assert_eq!(bob_only.commits[0].author, "Bob");
+    }
+
+    #[test]
+    fn repo_tab_search_layout_and_lookup_work_across_pages() {
+        let (_dir, engine, hashes) = init_test_repo();
+        let loaded = engine
+            .graph(&GraphOptions {
+                max_commits: 2,
+                ..Default::default()
+            })
+            .unwrap()
+            .commits;
+
+        let mut tab = RepoTabState::new(1, engine.clone());
+        tab.all_commits = loaded.clone();
+        tab.head_hash = Some(hashes[3].clone());
+        tab.recompute_visible_rows();
+        assert_eq!(tab.visible_commit_count(), 2);
+
+        let out = execute_history_search(&engine, "legacy-needle-42", &loaded, None).unwrap();
+        tab.filter.search_query = "legacy-needle-42".to_string();
+        tab.search_match_count = Some(out.commits.len());
+        tab.search_results = Some(out.commits);
+        tab.recompute_visible_rows();
+
+        assert_eq!(tab.visible_commit_count(), 2);
+        assert!(tab.find_commit(&hashes[0]).is_some());
+        assert!(tab.visible_index_of(&hashes[0]).is_some());
+        assert!(tab.layout.rows.iter().all(|r| r.segments.is_empty()));
+
+        // 清空搜索恢复常规分页图谱
+        tab.filter.search_query.clear();
+        tab.clear_search_state();
+        assert_eq!(tab.visible_commit_count(), 2);
+        assert!(tab.find_commit(&hashes[0]).is_none());
+    }
 }

@@ -1,13 +1,12 @@
 //! 原生 macOS 质感物理动效状态机与校验辅助函数。
 //!
 //! 包含：
-//! - [`RubberBandSpring`]：触边阻尼过冲累加与 `ely_core::motion::spring` 弹性回弹模型（静止后零帧请求）。
-//! - [`PullRefreshState`]：提交列表顶部下拉刷新状态机（`Idle` / `Pulling` / `Rebounding` / `Refreshing` / `Done`）。
+//! - [`RubberBandSpring`]：四向触边阻尼过冲累加与 `ely_core::motion::spring` 弹性回弹模型（静止后零帧请求）。
 //! - 模态弹窗输入校验辅助函数（驱动 `Shake` 计数与提示文案）。
 
 use std::time::{Duration, Instant};
 
-use ely_core::motion::{Refresh, ease_out_cubic, spring};
+use ely_core::motion::spring;
 
 /// 弹性释放动画片段（记录起跳偏移与起止时间）。
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -213,261 +212,6 @@ impl RubberBandSpring {
     }
 }
 
-/// 顶部下拉刷新状态阶段。
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum PullRefreshPhase {
-    Idle,
-    Pulling { progress: f32 },
-    Rebounding { progress: f32 },
-    Refreshing,
-    Done,
-}
-
-/// [`PullRefreshState::tick_at`] 的单帧状态推进结果。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PullRefreshTick {
-    /// 是否仍在播放收起动画（需要继续请求下一帧）。
-    pub animating: bool,
-    /// 本帧是否因超时释放而触发了实际刷新。
-    pub trigger_refresh: bool,
-}
-
-/// 提交列表顶部下拉刷新状态机。
-///
-/// 状态流转：
-/// `Idle` -> `Pulling { progress }` -> (未拉满松手) `Rebounding` -> `Idle`
-/// `Idle` -> `Pulling { progress >= 1.0 }` -> (松手/超时) `Refreshing` -> `Done` -> (900ms) `Idle`
-#[derive(Debug, Clone, PartialEq)]
-pub struct PullRefreshState {
-    phase: PullRefreshPhase,
-    raw_pull: f32,
-    progress: f32,
-    last_pull_at: Option<Instant>,
-    rebound_from: f32,
-    rebound_started_at: Option<Instant>,
-    done_started_at: Option<Instant>,
-    serial: u64,
-}
-
-impl Default for PullRefreshState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl PullRefreshState {
-    /// 拉满触发刷新的等效下拉距离（px）。
-    pub const TRIGGER_PULL_PX: f32 = 64.0;
-    /// 超过该间隔无新下拉事件时自动判定释放。
-    pub const IDLE_RELEASE_TIMEOUT: Duration = Duration::from_millis(140);
-    /// 未拉满取消后的收起时长。
-    pub const REBOUND_DURATION: Duration = Duration::from_millis(220);
-    /// 刷新完成后展示「Up to date」的停留时长。
-    pub const DONE_HOLD_DURATION: Duration = Duration::from_millis(900);
-
-    /// 创建处于 `Idle` 的下拉刷新状态机。
-    pub fn new() -> Self {
-        Self {
-            phase: PullRefreshPhase::Idle,
-            raw_pull: 0.0,
-            progress: 0.0,
-            last_pull_at: None,
-            rebound_from: 0.0,
-            rebound_started_at: None,
-            done_started_at: None,
-            serial: 0,
-        }
-    }
-
-    /// 当前所处阶段。
-    pub fn phase(&self) -> PullRefreshPhase {
-        self.phase
-    }
-
-    /// 当前下拉进度（保证处于 `[0.0, 1.0]`）。
-    pub fn progress(&self) -> f32 {
-        self.progress.clamp(0.0, 1.0)
-    }
-
-    /// 状态单调递增序列号（用于定时器防过期）。
-    pub fn serial(&self) -> u64 {
-        self.serial
-    }
-
-    /// 转换为 `ely_core::motion::Refresh`（已严格 clamp 到 `[0.0, 1.0]`，不会触发断言 panic）。
-    pub fn to_refresh(&self) -> Refresh {
-        match self.phase {
-            PullRefreshPhase::Idle => Refresh::Idle,
-            PullRefreshPhase::Pulling { progress } | PullRefreshPhase::Rebounding { progress } => {
-                Refresh::Pulling(progress.clamp(0.0, 1.0))
-            }
-            PullRefreshPhase::Refreshing => Refresh::Refreshing,
-            PullRefreshPhase::Done => Refresh::Done,
-        }
-    }
-
-    /// 是否需要逐帧刷新收起动画。
-    pub fn is_animating(&self) -> bool {
-        matches!(self.phase, PullRefreshPhase::Rebounding { .. })
-    }
-
-    /// 重置回 `Idle`（不递增 `serial`）。
-    fn reset_to_idle(&mut self) {
-        self.phase = PullRefreshPhase::Idle;
-        self.raw_pull = 0.0;
-        self.progress = 0.0;
-        self.last_pull_at = None;
-        self.rebound_from = 0.0;
-        self.rebound_started_at = None;
-        self.done_started_at = None;
-    }
-
-    /// 强制取消并返回 `Idle`（递增 `serial` 以使旧定时器失效）。
-    pub fn cancel(&mut self) {
-        self.serial = self.serial.saturating_add(1);
-        self.reset_to_idle();
-    }
-
-    /// 在指定时刻 `now` 累加竖向拉动增量 `dy`。
-    pub fn pull_at(&mut self, dy: f32, now: Instant) -> f32 {
-        if matches!(
-            self.phase,
-            PullRefreshPhase::Refreshing | PullRefreshPhase::Done
-        ) {
-            return self.progress();
-        }
-        if !dy.is_finite() {
-            return self.progress();
-        }
-        if matches!(self.phase, PullRefreshPhase::Idle) && dy <= 0.0 {
-            return 0.0;
-        }
-        if matches!(self.phase, PullRefreshPhase::Rebounding { .. }) {
-            self.raw_pull = self.progress * Self::TRIGGER_PULL_PX;
-            self.rebound_started_at = None;
-        }
-        self.raw_pull = (self.raw_pull + dy).clamp(0.0, Self::TRIGGER_PULL_PX * 1.5);
-        self.progress = (self.raw_pull / Self::TRIGGER_PULL_PX).clamp(0.0, 1.0);
-        if self.raw_pull <= 0.05 {
-            self.reset_to_idle();
-            return 0.0;
-        }
-        self.phase = PullRefreshPhase::Pulling {
-            progress: self.progress,
-        };
-        self.last_pull_at = Some(now);
-        self.progress
-    }
-
-    /// 松手或超时释放下拉状态；若已拉满则返回 `true` 并进入 `Refreshing`。
-    pub fn release(&mut self, reduced_motion: bool) -> bool {
-        self.release_at(Instant::now(), reduced_motion)
-    }
-
-    /// 在指定时刻 `now` 释放下拉状态；若已拉满则返回 `true` 并进入 `Refreshing`。
-    pub fn release_at(&mut self, now: Instant, reduced_motion: bool) -> bool {
-        let PullRefreshPhase::Pulling { progress } = self.phase else {
-            return false;
-        };
-        self.last_pull_at = None;
-        if progress >= 1.0 {
-            self.phase = PullRefreshPhase::Refreshing;
-            self.raw_pull = 0.0;
-            self.progress = 1.0;
-            self.rebound_started_at = None;
-            self.done_started_at = None;
-            self.serial = self.serial.saturating_add(1);
-            return true;
-        }
-        if reduced_motion || progress <= 0.02 {
-            self.reset_to_idle();
-        } else {
-            self.raw_pull = 0.0;
-            self.rebound_from = progress.clamp(0.0, 1.0);
-            self.rebound_started_at = Some(now);
-            self.phase = PullRefreshPhase::Rebounding {
-                progress: self.rebound_from,
-            };
-        }
-        false
-    }
-
-    /// 异步刷新完成后调用，进入 `Done` 短暂展示状态。
-    pub fn finish_refresh(&mut self) {
-        self.finish_refresh_at(Instant::now());
-    }
-
-    /// 在指定时刻 `now` 完成刷新并进入 `Done`。
-    pub fn finish_refresh_at(&mut self, now: Instant) {
-        if matches!(self.phase, PullRefreshPhase::Refreshing) {
-            self.phase = PullRefreshPhase::Done;
-            self.done_started_at = Some(now);
-            self.serial = self.serial.saturating_add(1);
-        }
-    }
-
-    /// 结束 `Done` 展示并收起回 `Idle`。
-    pub fn finish_done(&mut self) {
-        if matches!(self.phase, PullRefreshPhase::Done) {
-            self.reset_to_idle();
-        }
-    }
-
-    /// 推进一帧状态（含下拉空闲超时释放、回弹动画与 `Done` 停留收起）。
-    pub fn tick(&mut self, reduced_motion: bool) -> PullRefreshTick {
-        self.tick_at(Instant::now(), reduced_motion)
-    }
-
-    /// 在指定时刻 `now` 推进状态机。
-    pub fn tick_at(&mut self, now: Instant, reduced_motion: bool) -> PullRefreshTick {
-        let mut trigger_refresh = false;
-        if matches!(self.phase, PullRefreshPhase::Pulling { .. })
-            && self
-                .last_pull_at
-                .is_some_and(|at| now.saturating_duration_since(at) >= Self::IDLE_RELEASE_TIMEOUT)
-        {
-            trigger_refresh = self.release_at(now, reduced_motion);
-        }
-
-        if let PullRefreshPhase::Rebounding { .. } = self.phase {
-            if reduced_motion {
-                self.reset_to_idle();
-                return PullRefreshTick {
-                    animating: false,
-                    trigger_refresh,
-                };
-            }
-            if let Some(started) = self.rebound_started_at {
-                let t = (now.saturating_duration_since(started).as_secs_f32()
-                    / Self::REBOUND_DURATION.as_secs_f32().max(f32::EPSILON))
-                .clamp(0.0, 1.0);
-                if t >= 1.0 {
-                    self.reset_to_idle();
-                } else {
-                    let next_p = (self.rebound_from * (1.0 - ease_out_cubic(t))).clamp(0.0, 1.0);
-                    self.progress = next_p;
-                    self.phase = PullRefreshPhase::Rebounding { progress: next_p };
-                }
-            } else {
-                self.reset_to_idle();
-            }
-        }
-
-        if matches!(self.phase, PullRefreshPhase::Done)
-            && self
-                .done_started_at
-                .is_some_and(|at| now.saturating_duration_since(at) >= Self::DONE_HOLD_DURATION)
-        {
-            self.reset_to_idle();
-        }
-
-        PullRefreshTick {
-            animating: self.is_animating(),
-            trigger_refresh,
-        }
-    }
-}
-
 /// 校验 Git 分支或标签通用引用名（空、空白、`-` 开头及 Git 禁止字符）。
 fn validate_git_ref_name(name: &str, kind_label: &str) -> Result<(), &'static str> {
     let trimmed = name.trim();
@@ -617,58 +361,17 @@ mod tests {
         assert_eq!(rem1, 0.0);
         assert!(bottom.offset() < 0.0);
 
-        // 大幅向反方向滑回：完全抵消后返回多余增量
+        // 大幅向反方向滑回：完全抵消后返回多余增量，继续向顶部过冲同样在 +20px 内饱和
         let rem2 = bottom.consume_opposite(500.0, t0, false);
         assert!(rem2 > 0.0);
         assert_eq!(bottom.offset(), 0.0);
         assert!(!bottom.is_active());
-    }
 
-    #[test]
-    fn pull_refresh_clamps_progress_and_handles_cancel_and_full_lifecycle() {
-        let mut pr = PullRefreshState::new();
-        let t0 = Instant::now();
-        assert_eq!(pr.to_refresh(), Refresh::Idle);
-
-        // 1. 下拉进度严格 clamp 到 [0.0, 1.0]，超大下拉也不会让 Refresh::Pulling panic
-        let p_partial = pr.pull_at(32.0, t0);
-        assert!((p_partial - 0.5).abs() < 1e-4);
-        assert_eq!(pr.to_refresh(), Refresh::Pulling(p_partial));
-
-        // 2. 未拉满松手 -> 进入 Rebounding 并平滑回弹归 Idle
-        assert!(!pr.release_at(t0, false));
-        assert!(matches!(pr.phase(), PullRefreshPhase::Rebounding { .. }));
-        assert!(pr.is_animating());
-        let mid = pr.tick_at(t0 + Duration::from_millis(110), false);
-        assert!(mid.animating);
-        assert!(!mid.trigger_refresh);
-        let done_rebound = pr.tick_at(t0 + Duration::from_millis(240), false);
-        assert!(!done_rebound.animating);
-        assert_eq!(pr.phase(), PullRefreshPhase::Idle);
-        assert_eq!(pr.to_refresh(), Refresh::Idle);
-
-        // 3. 拉满后即使过冲超大值也 clamp 到 1.0 -> 松手触发刷新 -> Refreshing -> Done -> Idle
-        let p_full = pr.pull_at(500.0, t0);
-        assert_eq!(p_full, 1.0);
-        assert_eq!(pr.to_refresh(), Refresh::Pulling(1.0));
-        assert!(pr.release_at(t0, false));
-        assert_eq!(pr.phase(), PullRefreshPhase::Refreshing);
-        assert_eq!(pr.to_refresh(), Refresh::Refreshing);
-
-        // 刷新期间忽略额外下拉
-        pr.pull_at(20.0, t0);
-        assert_eq!(pr.phase(), PullRefreshPhase::Refreshing);
-
-        // 完成刷新 -> Done -> 900ms 后自动回到 Idle
-        pr.finish_refresh_at(t0);
-        assert_eq!(pr.phase(), PullRefreshPhase::Done);
-        assert_eq!(pr.to_refresh(), Refresh::Done);
-
-        pr.tick_at(t0 + Duration::from_millis(500), false);
-        assert_eq!(pr.phase(), PullRefreshPhase::Done);
-        pr.tick_at(t0 + Duration::from_millis(950), false);
-        assert_eq!(pr.phase(), PullRefreshPhase::Idle);
-        assert_eq!(pr.to_refresh(), Refresh::Idle);
+        let top_pull = bottom.pull_at(400.0, t0, false);
+        assert!(top_pull > 0.0 && top_pull <= 20.0);
+        bottom.release_at(t0, false);
+        assert!(!bottom.tick_at(t0 + Duration::from_millis(300), false));
+        assert_eq!(bottom.offset(), 0.0);
     }
 
     #[test]

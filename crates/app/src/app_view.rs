@@ -34,7 +34,7 @@ use crate::modals::{
     ActiveModal, ContextMenuState, ContextMenuTarget, PendingWriteOp, build_context_menu,
     compute_push_defaults, render_active_modal,
 };
-use crate::motion_fx::{PullRefreshPhase, PullRefreshState, RubberBandSpring};
+use crate::motion_fx::RubberBandSpring;
 use crate::repo_tab::{
     FileSection, PendingFlashTarget, RepoTabState, SelectedFile, execute_history_search,
     load_commit_details, load_file_diff, load_file_line_counts, load_repo_snapshot,
@@ -374,7 +374,6 @@ impl GitGraphApp {
                 tab.loading_graph = false;
                 tab.loading_more = false;
                 let mut post_refresh_flash: Option<String> = None;
-                let mut schedule_pull_done_serial: Option<u64> = None;
                 match res {
                     Ok(snap) => {
                         tab.error = None;
@@ -388,11 +387,6 @@ impl GitGraphApp {
                         tab.sync_status = snap.sync_status;
                         tab.recompute_visible_rows();
                         let should_research = !soft && tab.is_search_active();
-
-                        if matches!(tab.pull_refresh.phase(), PullRefreshPhase::Refreshing) {
-                            tab.pull_refresh.finish_refresh();
-                            schedule_pull_done_serial = Some(tab.pull_refresh.serial());
-                        }
 
                         if let Some(target) = tab.pending_flash_target.take() {
                             let resolved = match target {
@@ -434,13 +428,7 @@ impl GitGraphApp {
                     Err(err) => {
                         tab.error = Some(err);
                         tab.pending_flash_target = None;
-                        if matches!(tab.pull_refresh.phase(), PullRefreshPhase::Refreshing) {
-                            tab.pull_refresh.cancel();
-                        }
                     }
-                }
-                if let Some(done_serial) = schedule_pull_done_serial {
-                    this.schedule_pull_refresh_done_hide(tab_id, done_serial, cx);
                 }
                 if let Some(hash) = post_refresh_flash {
                     this.trigger_commit_flash(tab_id, hash, cx);
@@ -1077,7 +1065,7 @@ impl GitGraphApp {
         cx.notify();
     }
 
-    /// 处理主提交列表的顶部下拉刷新与底部触底阻尼弹性反馈。
+    /// 处理主提交列表顶部与底部的纯物理橡皮筋触边阻尼回弹反馈。
     pub fn handle_graph_list_vertical_scroll(
         &mut self,
         event: &ScrollEvent,
@@ -1101,24 +1089,12 @@ impl GitGraphApp {
             return;
         };
 
-        if event.touch_phase == TouchPhase::Cancelled {
-            tab._pull_refresh_task = None;
-            tab._bottom_overscroll_task = None;
-            tab.pull_refresh.cancel();
-            tab.bottom_overscroll.release(reduced_motion);
-            cx.notify();
-            return;
-        }
-
-        if event.touch_phase == TouchPhase::Ended {
-            tab._pull_refresh_task = None;
-            tab._bottom_overscroll_task = None;
-            let triggered = tab.pull_refresh.release(reduced_motion);
-            tab.bottom_overscroll.release(reduced_motion);
-            if triggered {
-                self.soft_refresh_tab(tab_id, cx);
+        if matches!(event.touch_phase, TouchPhase::Ended | TouchPhase::Cancelled) {
+            tab._vertical_overscroll_task = None;
+            if tab.vertical_overscroll.is_active() {
+                tab.vertical_overscroll.release(reduced_motion);
+                cx.notify();
             }
-            cx.notify();
             return;
         }
 
@@ -1136,63 +1112,46 @@ impl GitGraphApp {
         };
 
         let now = Instant::now();
-        let mut pull_active = false;
-        let mut bottom_active = false;
+        let mut changed = false;
 
         if dy > 0.01 {
-            if tab.bottom_overscroll.offset() < -0.01 {
-                let rem = tab
-                    .bottom_overscroll
-                    .consume_opposite(dy, now, reduced_motion);
-                bottom_active = tab.bottom_overscroll.is_active();
-                if rem > 0.01 && at_top && !tab.is_search_active() {
-                    tab.pull_refresh.pull_at(rem, now);
-                    pull_active = matches!(tab.pull_refresh.phase(), PullRefreshPhase::Pulling { .. });
-                }
-            } else if at_top && !tab.is_search_active() {
-                tab.pull_refresh.pull_at(dy, now);
-                pull_active = matches!(tab.pull_refresh.phase(), PullRefreshPhase::Pulling { .. });
+            let rem = if tab.vertical_overscroll.offset() < -0.01 {
+                changed = true;
+                tab.vertical_overscroll
+                    .consume_opposite(dy, now, reduced_motion)
+            } else {
+                dy
+            };
+            if rem > 0.01 && at_top {
+                tab.vertical_overscroll.pull_at(rem, now, reduced_motion);
+                changed = true;
             }
         } else if dy < -0.01 {
-            if matches!(tab.pull_refresh.phase(), PullRefreshPhase::Pulling { .. }) {
-                tab.pull_refresh.pull_at(dy, now);
-                pull_active = matches!(tab.pull_refresh.phase(), PullRefreshPhase::Pulling { .. });
-            } else if at_bottom && !tab.more_available {
-                tab.bottom_overscroll.pull_at(dy, now, reduced_motion);
-                bottom_active = tab.bottom_overscroll.is_active();
+            let rem = if tab.vertical_overscroll.offset() > 0.01 {
+                changed = true;
+                tab.vertical_overscroll
+                    .consume_opposite(dy, now, reduced_motion)
+            } else {
+                dy
+            };
+            if rem < -0.01 && at_bottom && !tab.more_available {
+                tab.vertical_overscroll.pull_at(rem, now, reduced_motion);
+                changed = true;
             }
         }
 
-        if pull_active {
-            tab._pull_refresh_task = Some(cx.spawn(async move |weak, cx| {
-                cx.background_executor()
-                    .timer(PullRefreshState::IDLE_RELEASE_TIMEOUT + Duration::from_millis(8))
-                    .await;
-                weak.update(cx, |this, cx| {
-                    let reduced = cx.theme().reduced_motion;
-                    let triggered = this
-                        .tab_by_id_mut(tab_id)
-                        .is_some_and(|tab| tab.pull_refresh.tick(reduced).trigger_refresh);
-                    if triggered {
-                        this.soft_refresh_tab(tab_id, cx);
-                    }
-                    cx.notify();
-                })
-                .ok();
-            }));
-        }
-
-        if bottom_active && !reduced_motion {
-            tab._bottom_overscroll_task = Some(cx.spawn(async move |weak, cx| {
+        let active = tab.vertical_overscroll.is_active();
+        if active && !reduced_motion {
+            tab._vertical_overscroll_task = Some(cx.spawn(async move |weak, cx| {
                 cx.background_executor()
                     .timer(RubberBandSpring::IDLE_RELEASE_TIMEOUT + Duration::from_millis(8))
                     .await;
                 weak.update(cx, |this, cx| {
                     let reduced = cx.theme().reduced_motion;
                     if let Some(tab) = this.tab_by_id_mut(tab_id)
-                        && tab.bottom_overscroll.needs_idle_release(Instant::now())
+                        && tab.vertical_overscroll.needs_idle_release(Instant::now())
                     {
-                        tab.bottom_overscroll.release(reduced);
+                        tab.vertical_overscroll.release(reduced);
                         cx.notify();
                     }
                 })
@@ -1200,34 +1159,9 @@ impl GitGraphApp {
             }));
         }
 
-        if pull_active || bottom_active || tab.pull_refresh.is_animating() {
+        if changed || active {
             cx.notify();
         }
-    }
-
-    fn schedule_pull_refresh_done_hide(
-        &mut self,
-        tab_id: u64,
-        done_serial: u64,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(tab) = self.tab_by_id_mut(tab_id) else {
-            return;
-        };
-        tab._pull_refresh_task = Some(cx.spawn(async move |weak, cx| {
-            cx.background_executor()
-                .timer(PullRefreshState::DONE_HOLD_DURATION)
-                .await;
-            weak.update(cx, |this, cx| {
-                if let Some(tab) = this.tab_by_id_mut(tab_id)
-                    && tab.pull_refresh.serial() == done_serial
-                {
-                    tab.pull_refresh.finish_done();
-                    cx.notify();
-                }
-            })
-            .ok();
-        }));
     }
 
     /// 将当前活动仓库图形列的水平滚动位置一键复位到最左侧。
@@ -2739,20 +2673,12 @@ impl Render for GitGraphApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let reduced_motion = cx.theme().reduced_motion;
         if let Some(tab) = self.active_tab_mut() {
-            let tab_id = tab.id;
             let mut need_frame = false;
             if tab.graph_overscroll.is_active() && tab.graph_overscroll.tick(reduced_motion) {
                 need_frame = true;
             }
-            if tab.bottom_overscroll.is_active() && tab.bottom_overscroll.tick(reduced_motion) {
+            if tab.vertical_overscroll.is_active() && tab.vertical_overscroll.tick(reduced_motion) {
                 need_frame = true;
-            }
-            let pr = tab.pull_refresh.tick(reduced_motion);
-            if pr.animating {
-                need_frame = true;
-            }
-            if pr.trigger_refresh {
-                self.soft_refresh_tab(tab_id, cx);
             }
             if need_frame {
                 window.request_animation_frame();

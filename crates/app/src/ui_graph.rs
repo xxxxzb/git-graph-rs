@@ -9,8 +9,7 @@ use ely_core::data_display::{Badge, Tone};
 use ely_core::feedback::{EmptyState, ErrorView};
 use ely_core::forms::{Checkbox, Choice, SearchInput, Select};
 use ely_core::motion::{
-    Refresh, RefreshIndicator, Shimmer, SkeletonTable, Spinner, SpinnerStyle, duration,
-    ease_out_cubic,
+    Shimmer, SkeletonTable, Spinner, SpinnerStyle, duration, ease_out_cubic,
 };
 use ely_core::primitives::{Icon, IconName};
 use ely_core::shell::{Toolbar, ToolbarGroup, ToolbarSeparator};
@@ -607,8 +606,7 @@ pub fn render_graph_table(
     let head_hash = tab.head_hash.clone();
     let selected_hash = tab.selected_hash.clone();
     let overscroll_x = tab.graph_overscroll.offset();
-    let bottom_bounce = tab.bottom_overscroll.offset().abs();
-    let refresh_state = tab.pull_refresh.to_refresh();
+    let vertical_bounce = tab.vertical_overscroll.offset();
     let flash_commit = tab.flash_commit.clone();
 
     let body: AnyElement = if let Some(err) = &tab.error {
@@ -957,7 +955,9 @@ pub fn render_graph_table(
         .track_scroll(&tab.graph_scroll)
         .size_full();
 
-        let is_pull_idle = refresh_state == Refresh::Idle;
+        let top_bounce = vertical_bounce.max(0.0);
+        let bottom_bounce = (-vertical_bounce).max(0.0);
+        let top_ratio = (top_bounce / 20.0).clamp(0.0, 1.0);
         let bottom_ratio = (bottom_bounce / 20.0).clamp(0.0, 1.0);
         let weak_list_scroll = weak.clone();
 
@@ -966,8 +966,6 @@ pub fn render_graph_table(
             .relative()
             .size_full()
             .overflow_hidden()
-            .flex()
-            .flex_col()
             .on_scroll(move |event: &ScrollEvent, _, cx| {
                 weak_list_scroll
                     .update(cx, |this, cx| {
@@ -977,34 +975,17 @@ pub fn render_graph_table(
             })
             .child(
                 div()
-                    .w_full()
-                    .flex_none()
-                    .when(!is_pull_idle, |el| {
-                        el.bg(colors.surface.opacity(0.65))
-                            .border_b_1()
-                            .border_color(colors.border.opacity(0.6))
-                    })
-                    .child(RefreshIndicator::new(
-                        ("graph-pull-refresh", tab_id),
-                        refresh_state,
-                    )),
+                    .size_full()
+                    .when(top_bounce > 0.2, |el| el.pt(px(top_bounce * 0.7)))
+                    .when(bottom_bounce > 0.2, |el| el.pb(px(bottom_bounce * 0.7)))
+                    .child(list),
             )
-            .child(
-                div()
-                    .relative()
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_hidden()
-                    .child(
-                        div()
-                            .size_full()
-                            .when(bottom_bounce > 0.2, |el| el.pb(px(bottom_bounce * 0.65)))
-                            .child(list),
-                    )
-                    .when(bottom_ratio > 0.01, |el| {
-                        el.child(render_bottom_overscroll_glow(bottom_ratio, colors.accent))
-                    }),
-            )
+            .when(top_ratio > 0.01, |el| {
+                el.child(render_vertical_overscroll_glow(true, top_ratio, colors.accent))
+            })
+            .when(bottom_ratio > 0.01, |el| {
+                el.child(render_vertical_overscroll_glow(false, bottom_ratio, colors.accent))
+            })
             .into_any_element()
     };
 
@@ -1018,30 +999,34 @@ pub fn render_graph_table(
         .into_any_element()
 }
 
-fn render_bottom_overscroll_glow(ratio: f32, accent: Hsla) -> AnyElement {
-    let glow_h = px(4.0 + 18.0 * ratio);
-    div()
+fn render_vertical_overscroll_glow(at_top: bool, ratio: f32, accent: Hsla) -> AnyElement {
+    let glow_h = px(4.0 + 16.0 * ratio);
+    let strong = div()
+        .w_full()
+        .h(glow_h * 0.45)
+        .bg(accent.opacity(0.14 * ratio));
+    let soft = div()
+        .w_full()
+        .h(glow_h * 0.55)
+        .bg(accent.opacity(0.05 * ratio));
+
+    let base = div()
         .absolute()
-        .bottom_0()
         .left_0()
         .right_0()
         .h(glow_h)
         .flex()
-        .flex_col()
-        .justify_end()
-        .child(
-            div()
-                .w_full()
-                .h(glow_h * 0.5)
-                .bg(accent.opacity(0.06 * ratio)),
-        )
-        .child(
-            div()
-                .w_full()
-                .h(glow_h * 0.5)
-                .bg(accent.opacity(0.16 * ratio)),
-        )
-        .into_any_element()
+        .flex_col();
+
+    if at_top {
+        base.top_0().child(strong).child(soft).into_any_element()
+    } else {
+        base.bottom_0()
+            .justify_end()
+            .child(soft)
+            .child(strong)
+            .into_any_element()
+    }
 }
 
 fn render_end_of_list_row(total_rows: usize, row_h: Pixels, cx: &App) -> AnyElement {

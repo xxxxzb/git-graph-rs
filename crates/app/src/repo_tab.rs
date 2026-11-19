@@ -16,7 +16,7 @@ use git_graph_ops::{BranchSyncStatus, GitCli, RepoWatcher};
 use gpui::{Image, SharedString, Task, UniformListScrollHandle};
 
 use crate::diff_parser::{ParsedDiff, parse_unified_diff, stretches_from_texts};
-use crate::motion_fx::{PullRefreshState, RubberBandSpring};
+use crate::motion_fx::RubberBandSpring;
 use crate::state::{
     FilterCriteria, commit_to_node, compute_graph_layout, filter_commit_indices,
     image_format_for_path, matches_author_filter, matches_commit_query, repo_display_name,
@@ -133,10 +133,8 @@ pub struct RepoTabState {
     pub graph_scroll_x: f32,
     /// 图形列左右触边橡皮筋阻尼回弹模型。
     pub graph_overscroll: RubberBandSpring,
-    /// 主提交列表底部触底阻尼回弹模型。
-    pub bottom_overscroll: RubberBandSpring,
-    /// 主提交列表顶部下拉刷新状态机。
-    pub pull_refresh: PullRefreshState,
+    /// 主提交列表顶部/底部触边橡皮筋阻尼回弹模型（正值=触顶下拉，负值=触底上拉）。
+    pub vertical_overscroll: RubberBandSpring,
     /// 需要高亮闪动定位的提交 `(hash, flash_serial)`。
     pub flash_commit: Option<(String, u64)>,
     /// 单调递增的提交行闪动序列号。
@@ -146,8 +144,7 @@ pub struct RepoTabState {
     /// 底部状态栏同步成功轻闪序列号。
     pub sync_flash_serial: u64,
     pub _graph_overscroll_task: Option<Task<()>>,
-    pub _bottom_overscroll_task: Option<Task<()>>,
-    pub _pull_refresh_task: Option<Task<()>>,
+    pub _vertical_overscroll_task: Option<Task<()>>,
     pub _watcher: Option<RepoWatcher>,
     pub _watch_task: Option<Task<()>>,
 }
@@ -199,15 +196,13 @@ impl RepoTabState {
             graph_scroll: UniformListScrollHandle::new(),
             graph_scroll_x: 0.0,
             graph_overscroll: RubberBandSpring::new(RubberBandSpring::DEFAULT_MAX_PULL_PX),
-            bottom_overscroll: RubberBandSpring::new(20.0),
-            pull_refresh: PullRefreshState::new(),
+            vertical_overscroll: RubberBandSpring::new(20.0),
             flash_commit: None,
             flash_serial: 0,
             pending_flash_target: None,
             sync_flash_serial: 0,
             _graph_overscroll_task: None,
-            _bottom_overscroll_task: None,
-            _pull_refresh_task: None,
+            _vertical_overscroll_task: None,
             _watcher: None,
             _watch_task: None,
         }

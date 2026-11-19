@@ -10,11 +10,10 @@ use ely_core::feedback::{EmptyState, Toast, ToastViewport, Toaster};
 use ely_core::forms::{InputEvent, TextInput};
 use ely_core::layout::SplitPane;
 use ely_core::lists::{List, ListItem};
-use ely_core::menus::{ContextMenu, Menu};
-use ely_core::navigation::{EditorTab, EditorTabs};
+use ely_core::menus::{ContextMenu, Menu, MenuItem, OverflowMenu};
 use ely_core::primitives::{Icon, IconName, Severity};
 use ely_core::shell::{StatusBar, StatusBarItem, drag_region};
-use ely_core::theme::{ActiveTheme, ControlSize, IconSize, Mode, TextSize, Theme};
+use ely_core::theme::{ActiveTheme, ControlSize, IconSize, Mode, Radius, TextSize, Theme};
 use ely_git::DiffLayout;
 use git_graph_core::api::Engine;
 use git_graph_core::types::UNCOMMITTED;
@@ -23,7 +22,7 @@ use git_graph_ops::{
     check_checkout_safety, check_reset_safety,
 };
 use gpui::{
-    AnyElement, Axis, Context, Entity, FocusHandle, InteractiveElement, IntoElement,
+    AnyElement, Axis, Context, Entity, FocusHandle, InteractiveElement, IntoElement, MouseButton,
     ParentElement, PathPromptOptions, Pixels, Point, Render, ScrollStrategy, SharedString,
     Styled, Subscription, Window, div, prelude::*, px,
 };
@@ -300,12 +299,13 @@ impl GitGraphApp {
         cx.notify();
     }
 
-    pub fn reorder_tabs(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
-        if from >= self.tabs.len() || to >= self.tabs.len() || from == to {
+    pub fn clear_recent_repos(&mut self, cx: &mut Context<Self>) {
+        if self.persisted.recent_repos.is_empty() {
             return;
         }
-        let item = self.tabs.remove(from);
-        self.tabs.insert(to, item);
+        self.persisted.recent_repos.clear();
+        self.save_state();
+        self.push_toast("已清空最近打开的仓库记录", Severity::Info, None, cx);
         cx.notify();
     }
 
@@ -1858,12 +1858,14 @@ impl GitGraphApp {
     /* ---------- 壳层 UI 渲染 ---------- */
 
     fn render_titlebar(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let (colors, dark, title_text_size) = {
+        let (colors, dark, title_text_size, tab_text_size, tab_radius) = {
             let theme = cx.theme();
             (
                 theme.colors.clone(),
                 theme.is_dark(),
                 theme.text_size(TextSize::Sm),
+                theme.text_size(TextSize::Xs),
+                theme.radius(Radius::Sm),
             )
         };
         let weak = cx.weak_entity();
@@ -1890,47 +1892,124 @@ impl GitGraphApp {
                 )
                 .into_any_element()
         } else {
-            let editor_tabs: Vec<EditorTab> = self
-                .tabs
-                .iter()
-                .map(|tab| {
-                    EditorTab::new(tab.id.to_string(), tab.name.clone())
-                        .icon(IconName::GitBranch)
-                        .dirty(tab.uncommitted_count > 0)
-                })
-                .collect();
+            let tab_items = self.tabs.iter().map(|tab| {
+                let is_active = self.active_tab_id == Some(tab.id);
+                let tab_id = tab.id;
+                let dirty = tab.uncommitted_count > 0;
+                let weak_select = weak.clone();
+                let weak_close = weak.clone();
+                let tab_bg = if is_active { colors.bg } else { colors.sunken };
+                let tab_border = if is_active {
+                    colors.border
+                } else {
+                    gpui::transparent_black()
+                };
+                let fg = if is_active {
+                    colors.fg
+                } else {
+                    colors.fg_muted
+                };
+                let hover_bg = colors.hover;
 
-            let mut strip = EditorTabs::new("repo-editor-tabs", editor_tabs)
-                .on_select({
-                    let weak = weak.clone();
-                    move |id, _, cx| {
-                        if let Ok(tab_id) = id.parse::<u64>() {
-                            weak.update(cx, |this, cx| this.activate_tab(tab_id, cx)).ok();
-                        }
-                    }
-                })
-                .on_close({
-                    let weak = weak.clone();
-                    move |id, _, cx| {
-                        if let Ok(tab_id) = id.parse::<u64>() {
-                            weak.update(cx, |this, cx| this.close_tab(tab_id, cx)).ok();
-                        }
-                    }
-                })
-                .on_reorder({
-                    let weak = weak.clone();
-                    move |from, to, _, cx| {
-                        weak.update(cx, |this, cx| this.reorder_tabs(from, to, cx))
+                div()
+                    .id(("repo-tab", tab_id as usize))
+                    .flex_none()
+                    .h(px(28.0))
+                    .max_w(px(210.0))
+                    .px_2p5()
+                    .rounded(tab_radius)
+                    .bg(tab_bg)
+                    .border_1()
+                    .border_color(tab_border)
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .cursor_pointer()
+                    .occlude()
+                    .when(!is_active, |el| el.hover(move |s| s.bg(hover_bg)))
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        weak_select
+                            .update(cx, |this, cx| this.activate_tab(tab_id, cx))
                             .ok();
-                    }
-                });
+                    })
+                    .child(
+                        Icon::new(IconName::GitBranch)
+                            .size(IconSize::Xs)
+                            .color(if is_active { colors.accent } else { fg }),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .text_size(tab_text_size)
+                            .font_weight(if is_active {
+                                gpui::FontWeight::MEDIUM
+                            } else {
+                                gpui::FontWeight::NORMAL
+                            })
+                            .text_color(fg)
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(tab.name.clone()),
+                    )
+                    .when(dirty, |el| {
+                        el.child(
+                            div()
+                                .flex_none()
+                                .size(px(5.0))
+                                .rounded_full()
+                                .bg(colors.warning),
+                        )
+                    })
+                    .child(
+                        div()
+                            .id(("repo-tab-close", tab_id as usize))
+                            .flex_none()
+                            .size(px(16.0))
+                            .rounded(tab_radius)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .hover(move |s| s.bg(hover_bg))
+                            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                cx.stop_propagation();
+                                weak_close
+                                    .update(cx, |this, cx| this.close_tab(tab_id, cx))
+                                    .ok();
+                            })
+                            .child(
+                                Icon::new(IconName::X)
+                                    .size(IconSize::Xs)
+                                    .color(colors.fg_muted),
+                            ),
+                    )
+                    .into_any_element()
+            });
 
-            if let Some(active) = self.active_tab_id {
-                strip = strip.selected(active.to_string());
-            }
-
-            div().flex_1().min_w_0().child(strip).into_any_element()
+            div()
+                .id("repo-tabs-strip")
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .flex()
+                .items_center()
+                .gap_1()
+                .overflow_x_scroll()
+                .restrict_scroll_to_axis()
+                .children(tab_items)
+                .into_any_element()
         };
+
+        let active_repo_path = self.active_tab().map(|t| t.path.clone());
+        let recent_menu = build_recent_repos_menu(
+            &self.persisted.recent_repos,
+            active_repo_path.as_deref(),
+            &weak,
+        );
+        let recent_btn = OverflowMenu::new("titlebar-recent-repos", recent_menu)
+            .icon(IconName::ChevronDown)
+            .tooltip("最近打开的仓库");
 
         let open_btn = IconButton::new("titlebar-open-repo", IconName::Plus)
             .variant(ButtonVariant::Ghost)
@@ -1978,6 +2057,7 @@ impl GitGraphApp {
                     .items_center()
                     .gap_1()
                     .occlude()
+                    .child(recent_btn)
                     .child(open_btn)
                     .child(theme_btn),
             )
@@ -2250,5 +2330,98 @@ impl Render for GitGraphApp {
             .child(self.render_status_bar(cx))
             .children(modal_el)
             .child(ToastViewport::new("app-toasts", &self.toaster))
+    }
+}
+
+/// 生成「最近打开的仓库」下拉菜单中单条记录的展示文本（遇到同名仓库时追加父目录名以便区分）。
+fn recent_repo_menu_label(path: &std::path::Path, all_paths: &[PathBuf]) -> String {
+    let name = repo_display_name(path);
+    let duplicated = all_paths
+        .iter()
+        .filter(|other| repo_display_name(other) == name)
+        .count()
+        > 1;
+    if duplicated
+        && let Some(parent) = path
+            .parent()
+            .and_then(|p| p.file_name())
+            .map(|s| s.to_string_lossy())
+    {
+        format!("{name}  ({parent})")
+    } else {
+        name
+    }
+}
+
+/// 构建标题栏「最近打开的仓库」下拉菜单。
+fn build_recent_repos_menu(
+    recent_repos: &[PathBuf],
+    active_repo: Option<&std::path::Path>,
+    weak: &gpui::WeakEntity<GitGraphApp>,
+) -> Menu {
+    let recent_items: Vec<MenuItem> = if recent_repos.is_empty() {
+        vec![MenuItem::new("暂无最近打开的仓库").disabled(true)]
+    } else {
+        recent_repos
+            .iter()
+            .map(|path| {
+                let label = recent_repo_menu_label(path, recent_repos);
+                let is_active = active_repo.is_some_and(|active| active == path.as_path());
+                let target = path.clone();
+                let weak_open = weak.clone();
+                MenuItem::check(label, is_active).on_click(move |_, cx| {
+                    weak_open
+                        .update(cx, |this, cx| this.open_repo_path(target.clone(), cx))
+                        .ok();
+                })
+            })
+            .collect()
+    };
+
+    let weak_pick = weak.clone();
+    let mut menu = Menu::new()
+        .group("最近打开的仓库", recent_items)
+        .separator()
+        .item(
+            MenuItem::new("打开其他本地仓库…")
+                .icon(IconName::FolderOpen)
+                .keys("cmd-o")
+                .on_click(move |_, cx| {
+                    weak_pick
+                        .update(cx, |this, cx| this.pick_and_open_repo(cx))
+                        .ok();
+                }),
+        );
+
+    if !recent_repos.is_empty() {
+        let weak_clear = weak.clone();
+        menu = menu.item(
+            MenuItem::new("清空最近记录")
+                .icon(IconName::Trash2)
+                .on_click(move |_, cx| {
+                    weak_clear
+                        .update(cx, |this, cx| this.clear_recent_repos(cx))
+                        .ok();
+                }),
+        );
+    }
+
+    menu
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recent_repo_menu_label_disambiguates_duplicate_names() {
+        let paths = vec![
+            PathBuf::from("/Users/dev/work/app"),
+            PathBuf::from("/Users/dev/personal/app"),
+            PathBuf::from("/Users/dev/work/git-graph-rs"),
+        ];
+        assert_eq!(recent_repo_menu_label(&paths[0], &paths), "app  (work)");
+        assert_eq!(recent_repo_menu_label(&paths[1], &paths), "app  (personal)");
+        assert_eq!(recent_repo_menu_label(&paths[2], &paths), "git-graph-rs");
     }
 }

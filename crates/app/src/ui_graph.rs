@@ -30,15 +30,19 @@ use crate::modals::{ContextMenuTarget, parse_stash_index};
 use crate::repo_tab::RepoTabState;
 use crate::state::{ColumnWidths, commit_ref_labels, format_timestamp, short_hash};
 
-/// 行高：28px 经典高密度 Git Graph 列表行。
-const ROW_HEIGHT: f32 = 28.0;
+/// 基准行高（在 `ui_scale = 1.20` 下为 36px，降低信息密度）。
+const BASE_ROW_HEIGHT: f32 = 30.0;
+/// 按当前 UI 缩放计算实际行高。
+pub fn row_height(scale: f32) -> f32 {
+    (BASE_ROW_HEIGHT * scale).round()
+}
 /// 每个泳道宽度。
-const LANE_WIDTH: f32 = 16.0;
+const LANE_WIDTH: f32 = 20.0;
 /// 距列表底部多少行时自动触发加载下一页。
 const PREFETCH_TAIL: usize = 24;
 /// 手动拖拽图形列的最小 / 最大宽度限制。
-const GRAPH_MANUAL_MIN_WIDTH: f32 = 72.0;
-const GRAPH_MANUAL_MAX_WIDTH: f32 = 360.0;
+const GRAPH_MANUAL_MIN_WIDTH: f32 = 84.0;
+const GRAPH_MANUAL_MAX_WIDTH: f32 = 420.0;
 
 /// 统一计算表头与每一行共用的图形列宽度（保证 100% 水平对齐）。
 ///
@@ -97,7 +101,7 @@ impl HorizontalScrollLatch {
     }
 
     pub fn classify_at(&mut self, event: &ScrollEvent, now: Instant) -> ScrollAxisDecision {
-        let delta = event.delta.pixel_delta(px(ROW_HEIGHT));
+        let delta = event.delta.pixel_delta(px(BASE_ROW_HEIGHT));
         let dx = f32::from(delta.x);
         let dy = f32::from(delta.y);
 
@@ -351,7 +355,7 @@ pub fn render_filter_toolbar(
         .into();
 
     let branch_select = Select::new(("branch-filter", tab.id), branch_choices)
-        .size(ControlSize::Sm)
+        .size(ControlSize::Md)
         .selected(selected_branch)
         .on_change({
             let weak = weak.clone();
@@ -382,7 +386,7 @@ pub fn render_filter_toolbar(
         .into();
 
     let author_select = Select::new(("author-filter", tab.id), author_choices)
-        .size(ControlSize::Sm)
+        .size(ControlSize::Md)
         .selected(selected_author)
         .on_change({
             let weak = weak.clone();
@@ -408,9 +412,10 @@ pub fn render_filter_toolbar(
             }
         });
 
+    let scale = app.ui_scale();
     // 搜索框（支持 Esc 一键清空搜索）
     let search_box = div()
-        .w(px(236.0))
+        .w(px(236.0 * scale))
         .on_key_down({
             let weak = weak.clone();
             move |event: &KeyDownEvent, window, cx| {
@@ -433,7 +438,7 @@ pub fn render_filter_toolbar(
                 }
             }
         })
-        .child(SearchInput::new("graph-search", &app.search_input).size(ControlSize::Sm));
+        .child(SearchInput::new("graph-search", &app.search_input).size(ControlSize::Md));
 
     let search_status: Option<AnyElement> = tab.is_search_active().then(|| {
         if tab.search_loading {
@@ -445,12 +450,12 @@ pub fn render_filter_toolbar(
                 .child(
                     Spinner::new(("search-spinner", tab.id))
                         .style(SpinnerStyle::Dots)
-                        .size(IconSize::Xs)
+                        .size(IconSize::Sm)
                         .color(colors.accent),
                 )
                 .child(
                     div()
-                        .text_size(theme.text_size(TextSize::Xs))
+                        .text_size(theme.text_size(TextSize::Sm))
                         .text_color(colors.fg_muted)
                         .child("全历史检索中…"),
                 )
@@ -482,7 +487,7 @@ pub fn render_filter_toolbar(
     // 右侧动作按钮
     let jump_head_btn = IconButton::new("jump-head-btn", IconName::GitCommitHorizontal)
         .variant(ButtonVariant::Ghost)
-        .size(ControlSize::Sm)
+        .size(ControlSize::Md)
         .tooltip("跳转到 HEAD")
         .disabled(tab.head_hash.is_none())
         .on_click({
@@ -498,7 +503,7 @@ pub fn render_filter_toolbar(
         } else {
             ButtonVariant::Ghost
         })
-        .size(ControlSize::Sm)
+        .size(ControlSize::Md)
         .tooltip("显示 / 隐藏详情分栏")
         .on_click({
             let weak = weak.clone();
@@ -513,16 +518,16 @@ pub fn render_filter_toolbar(
         .bg(colors.surface)
         .border_b_1()
         .border_color(colors.border)
-        .px_2()
-        .py_1()
+        .px_3()
+        .py_1p5()
         .child(
             Toolbar::new()
                 .w_full()
                 .justify_between()
                 .child(
                     ToolbarGroup::new()
-                        .child(div().w(px(158.0)).child(branch_select))
-                        .child(div().w(px(142.0)).child(author_select))
+                        .child(div().w(px(158.0 * scale)).child(branch_select))
+                        .child(div().w(px(142.0 * scale)).child(author_select))
                         .child(div().px_1().child(remote_check))
                         .child(ToolbarSeparator)
                         .child(search_box)
@@ -569,6 +574,7 @@ pub fn render_graph_table(
     let theme = cx.theme();
     let colors = theme.colors.clone();
     let widths = app.persisted.column_widths.clone();
+    let scale = app.ui_scale();
     let graph_col_w = effective_graph_width(tab, &widths);
     let max_graph_scroll = max_graph_scroll_x(tab, graph_col_w);
     let graph_scroll_x = tab.graph_scroll_x.clamp(0.0, max_graph_scroll);
@@ -578,6 +584,7 @@ pub fn render_graph_table(
         graph_col_w,
         graph_scroll_x,
         &widths,
+        scale,
         weak.clone(),
         cx,
     );
@@ -692,7 +699,7 @@ pub fn render_graph_table(
 
                 let theme = cx.theme();
                 let colors = theme.colors.clone();
-                let row_h = px(ROW_HEIGHT);
+                let row_h = px(row_height(scale));
 
                 range
                     .map(|ix| {
@@ -749,6 +756,7 @@ pub fn render_graph_table(
                                 col_width: px(graph_col_w),
                                 row_height: row_h,
                                 lane_width: px(LANE_WIDTH),
+                                scale,
                                 scroll_x: graph_scroll_x,
                                 overscroll_x,
                                 has_overflow_left,
@@ -888,7 +896,7 @@ pub fn render_graph_table(
                                     .flex_none()
                                     .w(px(widths.date))
                                     .px_2()
-                                    .text_size(theme.text_size(TextSize::Xs))
+                                    .text_size(theme.text_size(TextSize::Sm))
                                     .text_color(colors.fg_muted)
                                     .overflow_hidden()
                                     .whitespace_nowrap()
@@ -900,7 +908,7 @@ pub fn render_graph_table(
                                     .flex_none()
                                     .w(px(widths.author))
                                     .px_2()
-                                    .text_size(theme.text_size(TextSize::Xs))
+                                    .text_size(theme.text_size(TextSize::Sm))
                                     .text_color(colors.fg_muted)
                                     .overflow_hidden()
                                     .whitespace_nowrap()
@@ -913,7 +921,7 @@ pub fn render_graph_table(
                                     .w(px(widths.commit))
                                     .px_2()
                                     .font_family(theme.mono_family.clone())
-                                    .text_size(theme.text_size(TextSize::Xs))
+                                    .text_size(theme.text_size(TextSize::Sm))
                                     .text_color(if is_head_commit {
                                         colors.accent
                                     } else {
@@ -1080,16 +1088,17 @@ fn render_table_header(
     graph_col_w: f32,
     graph_scroll_x: f32,
     widths: &ColumnWidths,
+    scale: f32,
     weak: gpui::WeakEntity<GitGraphApp>,
     cx: &App,
 ) -> AnyElement {
     let theme = cx.theme();
     let colors = &theme.colors;
-    let header_h = px(26.0);
+    let header_h = px(28.0 * scale);
 
     let col_label = |text: &'static str| {
         div()
-            .text_size(theme.text_size(TextSize::Xs))
+            .text_size(theme.text_size(TextSize::Sm))
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(colors.fg_muted)
             .child(text)
@@ -1342,7 +1351,7 @@ fn render_description_cell(
                     div()
                         .flex_none()
                         .pr_3()
-                        .text_size(theme.text_size(TextSize::Sm))
+                        .text_size(theme.text_size(TextSize::Base))
                         .font_weight(msg_weight)
                         .text_color(msg_color)
                         .whitespace_nowrap()
@@ -1630,9 +1639,9 @@ mod tests {
         tab.layout.max_lanes = 1;
         assert_eq!(effective_graph_width(&tab, &widths), 76.0);
 
-        // 5 泳道：5 * 16 + 24 = 104.0
+        // 5 泳道：5 * 20 + 24 = 124.0
         tab.layout.max_lanes = 5;
-        assert_eq!(effective_graph_width(&tab, &widths), 104.0);
+        assert_eq!(effective_graph_width(&tab, &widths), 124.0);
 
         // 超多泳道（30 泳道）：自适应上限 clamp 在 260.0
         tab.layout.max_lanes = 30;
@@ -1643,11 +1652,11 @@ mod tests {
         widths.graph = 88.0;
         assert_eq!(effective_graph_width(&tab, &widths), 88.0);
 
-        // 手动宽度的极窄/极宽边界安全 clamp 在 [72.0, 360.0]
+        // 手动宽度的极窄/极宽边界安全 clamp 在 [84.0, 420.0]
         widths.graph = 20.0;
-        assert_eq!(effective_graph_width(&tab, &widths), 72.0);
+        assert_eq!(effective_graph_width(&tab, &widths), 84.0);
         widths.graph = 600.0;
-        assert_eq!(effective_graph_width(&tab, &widths), 360.0);
+        assert_eq!(effective_graph_width(&tab, &widths), 420.0);
     }
 
     #[test]
@@ -1655,15 +1664,15 @@ mod tests {
         let (_dir, engine) = init_empty_repo();
         let mut tab = RepoTabState::new(1, engine);
 
-        // 5 条泳道内容宽 104px，列宽 120px 时不可滚动
+        // 5 条泳道内容宽 124px，列宽 140px 时不可滚动
         tab.layout.max_lanes = 5;
-        assert_eq!(graph_content_width(5), 104.0);
-        assert_eq!(max_graph_scroll_x(&tab, 120.0), 0.0);
+        assert_eq!(graph_content_width(5), 124.0);
+        assert_eq!(max_graph_scroll_x(&tab, 140.0), 0.0);
 
-        // 25 条泳道内容宽 424px，列宽 260px 时最大可滚 164px
+        // 25 条泳道内容宽 524px，列宽 260px 时最大可滚 264px
         tab.layout.max_lanes = 25;
-        assert_eq!(graph_content_width(25), 424.0);
-        assert_eq!(max_graph_scroll_x(&tab, 260.0), 164.0);
+        assert_eq!(graph_content_width(25), 524.0);
+        assert_eq!(max_graph_scroll_x(&tab, 260.0), 264.0);
     }
 
     #[test]

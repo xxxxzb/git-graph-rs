@@ -80,9 +80,10 @@ pub fn render_details_pane(
 
     let split_sizes = app.persisted.horizontal_split;
 
+    let scale = app.ui_scale();
     wrap_transition(
         div().size_full().bg(colors.surface).child(
-            SplitPane::new("details-h-split", Axis::Horizontal, px(240.0))
+            SplitPane::new("details-h-split", Axis::Horizontal, px(240.0 * scale))
                 .pane(left_pane)
                 .pane(right_pane)
                 .sizes(&split_sizes)
@@ -182,7 +183,7 @@ fn render_uncommitted_left(tab: &RepoTabState, cx: &mut Context<GitGraphApp>) ->
         .border_color(colors.border)
         .child(
             div()
-                .text_size(theme.text_size(TextSize::Sm))
+                .text_size(theme.text_size(TextSize::Base))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(colors.fg)
                 .child(format!("未提交的更改 ({})", tab.scm_changes.len())),
@@ -191,7 +192,7 @@ fn render_uncommitted_left(tab: &RepoTabState, cx: &mut Context<GitGraphApp>) ->
             Button::new("uncommitted-stash-btn", "保存 Stash…")
                 .icon(IconName::Archive)
                 .variant(ButtonVariant::Secondary)
-                .size(ControlSize::Sm)
+                .size(ControlSize::Md)
                 .disabled(tab.scm_changes.is_empty())
                 .on_click({
                     let weak = weak.clone();
@@ -234,7 +235,7 @@ fn render_uncommitted_left(tab: &RepoTabState, cx: &mut Context<GitGraphApp>) ->
             .px_3()
             .py_1p5()
             .bg(colors.sunken.opacity(0.6))
-            .text_size(theme.text_size(TextSize::Xs))
+            .text_size(theme.text_size(TextSize::Sm))
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(colors.fg_muted)
             .child(title)
@@ -407,7 +408,7 @@ fn render_scm_row(
             div()
                 .flex_1()
                 .min_w_0()
-                .text_size(theme.text_size(TextSize::Xs))
+                .text_size(theme.text_size(TextSize::Sm))
                 .text_color(colors.fg)
                 .overflow_hidden()
                 .whitespace_nowrap()
@@ -496,7 +497,7 @@ fn render_commit_details_left(
                 .border_color(colors.border)
                 .child(
                     div()
-                        .text_size(theme.text_size(TextSize::Base))
+                        .text_size(theme.text_size(TextSize::Md))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(colors.fg)
                         .child(SelectableText::new("detail-subject", subject.to_string())),
@@ -504,7 +505,7 @@ fn render_commit_details_left(
                 .when(!body_rest.trim().is_empty(), |el| {
                     el.child(
                         div()
-                            .text_size(theme.text_size(TextSize::Xs))
+                            .text_size(theme.text_size(TextSize::Sm))
                             .text_color(colors.fg_muted)
                             .child(SelectableText::new(
                                 "detail-body",
@@ -519,7 +520,7 @@ fn render_commit_details_left(
                 .px_3()
                 .py_1p5()
                 .bg(colors.sunken.opacity(0.6))
-                .text_size(theme.text_size(TextSize::Xs))
+                .text_size(theme.text_size(TextSize::Sm))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(colors.fg_muted)
                 .child(format!("变更文件 ({})", details.file_changes.len())),
@@ -677,7 +678,7 @@ fn render_right_pane(
             DiffLayout::Split => "split",
         },
     )
-    .size(ControlSize::Sm)
+    .size(ControlSize::Md)
     .segment("unified", "Unified", None)
     .segment("split", "Split", None)
     .on_change({
@@ -729,7 +730,7 @@ fn render_right_pane(
             div()
                 .flex_1()
                 .min_w_0()
-                .text_size(theme.text_size(TextSize::Sm))
+                .text_size(theme.text_size(TextSize::Base))
                 .text_color(colors.fg)
                 .child(SelectableText::new("diff-file-path", selected_file.path.clone())),
         )

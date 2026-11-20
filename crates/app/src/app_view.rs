@@ -40,11 +40,13 @@ use crate::repo_tab::{
     load_commit_details, load_file_diff, load_file_line_counts, load_repo_snapshot,
 };
 use crate::state::{
-    PersistedState, repo_display_name, save_persisted_state, short_hash,
+    DEFAULT_UI_SCALE, MAX_UI_SCALE, MIN_UI_SCALE, PersistedState, repo_display_name,
+    save_persisted_state, short_hash,
 };
 use crate::ui_details::render_details_pane;
 use crate::ui_graph::{
-    ResizeCol, SyncButtonAction, render_filter_toolbar, render_graph_table, sync_button_spec,
+    ResizeCol, SyncButtonAction, render_filter_toolbar, render_graph_table, row_height,
+    sync_button_spec,
 };
 
 gpui::actions!(
@@ -56,6 +58,9 @@ gpui::actions!(
         ToggleTheme,
         ToggleDetails,
         FocusSearch,
+        ZoomIn,
+        ZoomOut,
+        ZoomReset,
         QuitApp
     ]
 );
@@ -109,6 +114,8 @@ impl GitGraphApp {
             }
         };
 
+        window.set_rem_size(px(16.0 * persisted.ui_scale));
+
         let mut app = Self {
             focus,
             tabs: Vec::new(),
@@ -134,6 +141,22 @@ impl GitGraphApp {
         }
 
         app
+    }
+
+    /// 当前界面全局缩放倍率。
+    pub fn ui_scale(&self) -> f32 {
+        self.persisted.ui_scale
+    }
+
+    fn apply_ui_scale(&mut self, scale: f32, window: &mut Window, cx: &mut Context<Self>) {
+        let clamped = (scale.clamp(MIN_UI_SCALE, MAX_UI_SCALE) * 20.0).round() / 20.0;
+        if (self.persisted.ui_scale - clamped).abs() < 0.001 {
+            return;
+        }
+        self.persisted.ui_scale = clamped;
+        window.set_rem_size(px(16.0 * clamped));
+        self.save_state();
+        cx.notify();
     }
 
     pub fn active_tab(&self) -> Option<&RepoTabState> {
@@ -1075,7 +1098,7 @@ impl GitGraphApp {
         if event.modifiers.shift {
             return;
         }
-        let delta = event.delta.pixel_delta(px(28.0));
+        let delta = event.delta.pixel_delta(px(row_height(self.ui_scale())));
         let dx = f32::from(delta.x);
         let dy = f32::from(delta.y);
         if dx.abs() > dy.abs() && dx.abs() > 0.5 {
@@ -2196,13 +2219,14 @@ impl GitGraphApp {
     /* ---------- 壳层 UI 渲染 ---------- */
 
     fn render_titlebar(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let scale = self.ui_scale();
         let (colors, dark, title_text_size, tab_text_size, tab_radius) = {
             let theme = cx.theme();
             (
                 theme.colors.clone(),
                 theme.is_dark(),
+                theme.text_size(TextSize::Base),
                 theme.text_size(TextSize::Sm),
-                theme.text_size(TextSize::Xs),
                 theme.radius(Radius::Sm),
             )
         };
@@ -2252,8 +2276,8 @@ impl GitGraphApp {
                 div()
                     .id(("repo-tab", tab_id as usize))
                     .flex_none()
-                    .h(px(28.0))
-                    .max_w(px(210.0))
+                    .h(px(28.0 * scale))
+                    .max_w(px(210.0 * scale))
                     .px_2p5()
                     .rounded(tab_radius)
                     .bg(tab_bg)
@@ -2294,7 +2318,7 @@ impl GitGraphApp {
                         el.child(
                             div()
                                 .flex_none()
-                                .size(px(5.0))
+                                .size(px(5.0 * scale))
                                 .rounded_full()
                                 .bg(colors.warning),
                         )
@@ -2303,7 +2327,7 @@ impl GitGraphApp {
                         div()
                             .id(("repo-tab-close", tab_id as usize))
                             .flex_none()
-                            .size(px(16.0))
+                            .size(px(16.0 * scale))
                             .rounded(tab_radius)
                             .flex()
                             .items_center()
@@ -2351,7 +2375,7 @@ impl GitGraphApp {
 
         let open_btn = IconButton::new("titlebar-open-repo", IconName::Plus)
             .variant(ButtonVariant::Ghost)
-            .size(ControlSize::Sm)
+            .size(ControlSize::Md)
             .tooltip("打开本地仓库 (⌘O)")
             .on_click({
                 let weak = weak.clone();
@@ -2365,7 +2389,7 @@ impl GitGraphApp {
             if dark { IconName::Sun } else { IconName::Moon },
         )
         .variant(ButtonVariant::Ghost)
-        .size(ControlSize::Sm)
+        .size(ControlSize::Md)
         .tooltip(if dark { "切换至浅色模式" } else { "切换至深色模式" })
         .on_click({
             let weak = weak.clone();
@@ -2376,7 +2400,7 @@ impl GitGraphApp {
 
         drag_region("app-titlebar-drag", window, cx)
             .w_full()
-            .h(px(40.0))
+            .h(px(40.0 * scale))
             .flex_none()
             .flex()
             .items_center()
@@ -2447,7 +2471,7 @@ impl GitGraphApp {
                         .trailing(
                             IconButton::new(("remove-recent", ix), IconName::Trash2)
                                 .variant(ButtonVariant::Ghost)
-                                .size(ControlSize::Sm)
+                                .size(ControlSize::Md)
                                 .tooltip("从最近列表移除")
                                 .on_click(move |_, _, cx| {
                                     cx.stop_propagation();
@@ -2467,16 +2491,17 @@ impl GitGraphApp {
                         })
                 });
 
+            let scale = self.ui_scale();
             div()
                 .w_full()
-                .max_w(px(520.0))
+                .max_w(px(520.0 * scale))
                 .flex()
                 .flex_col()
                 .gap_2()
                 .child(
                     div()
                         .px_2()
-                        .text_size(theme.text_size(TextSize::Xs))
+                        .text_size(theme.text_size(TextSize::Sm))
                         .font_weight(gpui::FontWeight::SEMIBOLD)
                         .text_color(colors.fg_muted)
                         .child("最近打开的仓库"),
@@ -2501,7 +2526,7 @@ impl GitGraphApp {
             .p_6()
             .bg(colors.bg)
             .child(
-                div().w_full().max_w(px(560.0)).child(
+                div().w_full().max_w(px(560.0 * self.ui_scale())).child(
                     Stagger::new("start-page-stagger")
                         .entrance(Entrance::Rise)
                         .child(
@@ -2546,7 +2571,7 @@ impl GitGraphApp {
                     let details_pane = render_details_pane(self, tab, cx);
                     let weak = cx.weak_entity();
                     let v_sizes = self.persisted.vertical_split;
-                    SplitPane::new("main-v-split", Axis::Vertical, px(160.0))
+                    SplitPane::new("main-v-split", Axis::Vertical, px(160.0 * self.ui_scale()))
                         .pane(graph_table)
                         .pane(details_pane)
                         .sizes(&v_sizes)
@@ -2731,6 +2756,15 @@ impl Render for GitGraphApp {
             }))
             .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
                 this.focus_search(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ZoomIn, window, cx| {
+                this.apply_ui_scale(this.ui_scale() + 0.10, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ZoomOut, window, cx| {
+                this.apply_ui_scale(this.ui_scale() - 0.10, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ZoomReset, window, cx| {
+                this.apply_ui_scale(DEFAULT_UI_SCALE, window, cx);
             }))
             .child(self.render_titlebar(window, cx))
             .child(self.render_workspace_body(window, cx))

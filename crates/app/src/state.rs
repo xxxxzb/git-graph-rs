@@ -15,6 +15,16 @@ use serde::{Deserialize, Serialize};
 /// 默认最近仓库保留上限。
 const MAX_RECENT_REPOS: usize = 12;
 
+/// 默认全局 UI 缩放比例（相比标准 16px rem 基准放大 1.20x，降低信息密度）。
+pub const DEFAULT_UI_SCALE: f32 = 1.20;
+/// 允许的最小 / 最大 UI 缩放比例。
+pub const MIN_UI_SCALE: f32 = 0.90;
+pub const MAX_UI_SCALE: f32 = 1.60;
+
+fn default_ui_scale() -> f32 {
+    DEFAULT_UI_SCALE
+}
+
 /// 5 列宽度持久化配置（像素）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -29,11 +39,11 @@ pub struct ColumnWidths {
 impl Default for ColumnWidths {
     fn default() -> Self {
         Self {
-            graph: 132.0,
+            graph: 160.0,
             graph_manual: false,
-            date: 148.0,
-            author: 136.0,
-            commit: 86.0,
+            date: 184.0,
+            author: 168.0,
+            commit: 108.0,
         }
     }
 }
@@ -48,6 +58,8 @@ pub struct PersistedState {
     pub details_open: bool,
     pub vertical_split: [f32; 2],
     pub horizontal_split: [f32; 2],
+    #[serde(default = "default_ui_scale")]
+    pub ui_scale: f32,
 }
 
 impl Default for PersistedState {
@@ -59,6 +71,7 @@ impl Default for PersistedState {
             details_open: true,
             vertical_split: [0.58, 0.42],
             horizontal_split: [0.36, 0.64],
+            ui_scale: DEFAULT_UI_SCALE,
         }
     }
 }
@@ -104,7 +117,19 @@ pub fn save_persisted_state(state: &PersistedState) {
 /// 从指定路径读取持久化 JSON。
 pub fn load_state_from(path: &Path) -> anyhow::Result<PersistedState> {
     let raw = std::fs::read_to_string(path)?;
-    let state: PersistedState = serde_json::from_str(&raw)?;
+    let mut state: PersistedState = serde_json::from_str(&raw)?;
+    state.ui_scale = if state.ui_scale.is_finite() {
+        state.ui_scale.clamp(MIN_UI_SCALE, MAX_UI_SCALE)
+    } else {
+        DEFAULT_UI_SCALE
+    };
+    // 兼容旧版紧凑默认列宽，升级到放大后的舒适默认值
+    if (state.column_widths.date - 148.0).abs() < 0.5
+        && (state.column_widths.author - 136.0).abs() < 0.5
+        && (state.column_widths.commit - 86.0).abs() < 0.5
+    {
+        state.column_widths = ColumnWidths::default();
+    }
     Ok(state)
 }
 

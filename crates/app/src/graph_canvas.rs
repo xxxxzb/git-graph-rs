@@ -49,6 +49,7 @@ pub struct GraphCellStyle {
     pub col_width: Pixels,
     pub row_height: Pixels,
     pub lane_width: Pixels,
+    pub scale: f32,
     pub scroll_x: f32,
     /// 左右触边橡皮筋弹性偏移（px，正值表示左触边向右过冲，负值表示右触边向左过冲）。
     pub overscroll_x: f32,
@@ -69,6 +70,7 @@ pub fn paint_graph_cell(row: RowLayout, style: GraphCellStyle) -> AnyElement {
         col_width,
         row_height,
         lane_width,
+        scale,
         scroll_x,
         overscroll_x,
         has_overflow_left,
@@ -85,14 +87,14 @@ pub fn paint_graph_cell(row: RowLayout, style: GraphCellStyle) -> AnyElement {
         |_, _, _| {},
         move |bounds: Bounds<Pixels>, _, window, _| {
             window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
-                let left_pad = px(10.0) - px(scroll_x.max(0.0)) + px(overscroll_x);
+                let left_pad = px(10.0 * scale) - px(scroll_x.max(0.0)) + px(overscroll_x);
                 let lane_x = |lane: usize| -> Pixels {
                     bounds.origin.x + left_pad + lane_width * (lane as f32 + 0.5)
                 };
                 let top = bounds.origin.y;
                 let mid = bounds.origin.y + bounds.size.height * 0.5;
                 let bottom = bounds.origin.y + bounds.size.height;
-                let stroke_width = px(1.8);
+                let stroke_width = px(1.8 * scale);
 
                 // 1. 先绘制所有泳道连接线
                 for seg in &row.segments {
@@ -126,10 +128,11 @@ pub fn paint_graph_cell(row: RowLayout, style: GraphCellStyle) -> AnyElement {
                     row_bg,
                     muted_color,
                     stash_color,
+                    scale,
                 );
 
-                // 3. 左右存在可滚动泳道时，在列边缘绘制极淡的 2px 溢出提示
-                let hint_w = px(2.0);
+                // 3. 左右存在可滚动泳道时，在列边缘绘制极淡的溢出提示
+                let hint_w = px(2.0 * scale);
                 if has_overflow_left {
                     window.paint_quad(fill(
                         Bounds::new(bounds.origin, size(hint_w, bounds.size.height)),
@@ -149,7 +152,7 @@ pub fn paint_graph_cell(row: RowLayout, style: GraphCellStyle) -> AnyElement {
                 // 4. 左右触边橡皮筋回弹时，在对应边缘绘制柔和动态呼吸光晕（严格裁剪在 ContentMask 内）
                 if overscroll_x.abs() > 0.25 {
                     let ratio = (overscroll_x.abs() / 28.0).clamp(0.0, 1.0);
-                    let glow_w = px(6.0 + 14.0 * ratio);
+                    let glow_w = px((6.0 + 14.0 * ratio) * scale);
                     let bands = 4usize;
                     let band_w = glow_w / bands as f32;
                     for i in 0..bands {
@@ -165,7 +168,7 @@ pub fn paint_graph_cell(row: RowLayout, style: GraphCellStyle) -> AnyElement {
                             overscroll_glow_color.opacity(alpha),
                         ));
                     }
-                    let edge_w = px(1.5);
+                    let edge_w = px(1.5 * scale);
                     let edge_x = if overscroll_x > 0.0 {
                         bounds.origin.x
                     } else {
@@ -368,6 +371,7 @@ fn paint_node(
     row_bg: Hsla,
     muted_color: Hsla,
     stash_color: Hsla,
+    scale: f32,
 ) {
     let paint_circle = |window: &mut gpui::Window, diameter: Pixels, color: Hsla| {
         let r = diameter * 0.5;
@@ -376,38 +380,38 @@ fn paint_node(
 
     match kind {
         NodeKind::Uncommitted => {
-            paint_circle(window, px(9.5), muted_color);
-            paint_circle(window, px(5.5), row_bg);
+            paint_circle(window, px(9.5 * scale), muted_color);
+            paint_circle(window, px(5.5 * scale), row_bg);
         }
         NodeKind::Stash => {
-            paint_circle(window, px(10.5), stash_color);
-            paint_circle(window, px(5.0), row_bg);
-            paint_circle(window, px(2.5), stash_color);
+            paint_circle(window, px(10.5 * scale), stash_color);
+            paint_circle(window, px(5.0 * scale), row_bg);
+            paint_circle(window, px(2.5 * scale), stash_color);
         }
         NodeKind::Head => {
-            paint_circle(window, px(15.0), lane_color.opacity(0.24));
-            paint_circle(window, px(10.0), lane_color);
+            paint_circle(window, px(15.0 * scale), lane_color.opacity(0.24));
+            paint_circle(window, px(10.0 * scale), lane_color);
             if is_merge {
-                paint_circle(window, px(5.2), row_bg);
-                paint_circle(window, px(2.4), lane_color);
+                paint_circle(window, px(5.2 * scale), row_bg);
+                paint_circle(window, px(2.4 * scale), lane_color);
             } else {
-                paint_circle(window, px(3.4), row_bg);
+                paint_circle(window, px(3.4 * scale), row_bg);
             }
         }
         NodeKind::Merge => {
-            paint_circle(window, px(9.6), lane_color);
-            paint_circle(window, px(5.2), row_bg);
+            paint_circle(window, px(9.6 * scale), lane_color);
+            paint_circle(window, px(5.2 * scale), row_bg);
             if is_head {
-                paint_circle(window, px(2.6), lane_color);
+                paint_circle(window, px(2.6 * scale), lane_color);
             }
         }
         NodeKind::Normal => {
             if is_head {
-                paint_circle(window, px(14.5), lane_color.opacity(0.24));
+                paint_circle(window, px(14.5 * scale), lane_color.opacity(0.24));
             }
-            paint_circle(window, px(8.4), lane_color);
+            paint_circle(window, px(8.4 * scale), lane_color);
             if is_merge {
-                paint_circle(window, px(4.2), row_bg);
+                paint_circle(window, px(4.2 * scale), row_bg);
             }
         }
     }

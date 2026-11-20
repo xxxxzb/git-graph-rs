@@ -1262,7 +1262,7 @@ pub fn render_active_modal(
                     .collect()
             };
             let branch_select = Select::new("push-local-branch-select", branch_choices)
-                .size(ControlSize::Sm)
+                .size(ControlSize::Md)
                 .selected(selected_branch.clone())
                 .on_change({
                     let app = app_entity.clone();
@@ -1300,7 +1300,7 @@ pub fn render_active_modal(
                 .map(|r| Choice::new(r.clone(), r.clone()))
                 .collect();
             let remote_select = Select::new("push-remote-select", remote_choices)
-                .size(ControlSize::Sm)
+                .size(ControlSize::Md)
                 .placeholder("无可用远程仓库")
                 .disabled(remotes.is_empty())
                 .selected(selected_remote.clone())
@@ -1328,7 +1328,7 @@ pub fn render_active_modal(
             }
             .into();
             let force_control = SegmentedControl::new("push-force-mode", force_key)
-                .size(ControlSize::Sm)
+                .size(ControlSize::Md)
                 .segment("none", "关闭", None)
                 .segment("lease", "安全强推 (--force-with-lease)", None)
                 .segment("force", "强制覆盖 (--force)", None)

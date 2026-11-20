@@ -21,7 +21,7 @@ use gpui::{
 
 use crate::app_view::{
     CloseActiveTab, FocusSearch, GitGraphApp, OpenRepository, QuitApp, RefreshGraph, ToggleDetails,
-    ToggleTheme,
+    ToggleTheme, ZoomIn, ZoomOut, ZoomReset,
 };
 use crate::state::load_persisted_state;
 
@@ -46,6 +46,10 @@ fn app_menus() -> Vec<Menu> {
                 MenuItem::action("搜索历史提交…", FocusSearch),
                 MenuItem::action("刷新图谱", RefreshGraph),
                 MenuItem::action("显示 / 隐藏详情分栏", ToggleDetails),
+                MenuItem::separator(),
+                MenuItem::action("放大界面", ZoomIn),
+                MenuItem::action("缩小界面", ZoomOut),
+                MenuItem::action("重置界面缩放", ZoomReset),
                 MenuItem::separator(),
                 MenuItem::action("切换浅色 / 深色主题", ToggleTheme),
             ],
@@ -85,19 +89,23 @@ fn launch(initial_repos: Vec<PathBuf>, cx: &mut App) -> Result<()> {
         KeyBinding::new("cmd-r", RefreshGraph, Some("GitGraphApp")),
         KeyBinding::new("cmd-j", ToggleDetails, Some("GitGraphApp")),
         KeyBinding::new("cmd-f", FocusSearch, Some("GitGraphApp")),
+        KeyBinding::new("cmd-=", ZoomIn, Some("GitGraphApp")),
+        KeyBinding::new("cmd-+", ZoomIn, Some("GitGraphApp")),
+        KeyBinding::new("cmd--", ZoomOut, Some("GitGraphApp")),
+        KeyBinding::new("cmd-0", ZoomReset, Some("GitGraphApp")),
     ]);
     cx.on_action(|_: &QuitApp, cx| cx.quit());
     cx.set_menus(app_menus());
 
-    let bounds = Bounds::centered(None, size(px(1360.0), px(860.0)), cx);
+    let bounds = Bounds::centered(None, size(px(1520.0), px(960.0)), cx);
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         titlebar: Some(TitlebarOptions {
             title: Some("Git Graph RS".into()),
             appears_transparent: true,
-            traffic_light_position: Some(point(px(16.0), px(12.0))),
+            traffic_light_position: Some(point(px(16.0), px(16.0))),
         }),
-        window_min_size: Some(size(px(900.0), px(580.0))),
+        window_min_size: Some(size(px(980.0), px(640.0))),
         ..Default::default()
     };
 

@@ -48,12 +48,40 @@ impl Default for ColumnWidths {
     }
 }
 
+/// 界面配色主题风格预设。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThemePreset {
+    /// Ely 默认暖灰极简主题。
+    #[default]
+    Default,
+    /// Studio 高对比主题（Zinc + Sky，原型 D 配色）。
+    Studio,
+}
+
+impl ThemePreset {
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Default => "默认配色",
+            Self::Studio => "Studio 高对比",
+        }
+    }
+
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::Default => Self::Studio,
+            Self::Studio => Self::Default,
+        }
+    }
+}
+
 /// 持久化到本地应用目录的状态。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PersistedState {
     pub recent_repos: Vec<PathBuf>,
     pub dark_mode: bool,
+    pub theme_preset: ThemePreset,
     pub column_widths: ColumnWidths,
     pub details_open: bool,
     pub vertical_split: [f32; 2],
@@ -67,6 +95,7 @@ impl Default for PersistedState {
         Self {
             recent_repos: Vec::new(),
             dark_mode: false,
+            theme_preset: ThemePreset::default(),
             column_widths: ColumnWidths::default(),
             details_open: true,
             vertical_split: [0.58, 0.42],
@@ -383,6 +412,7 @@ mod tests {
 
         let mut state = PersistedState {
             dark_mode: true,
+            theme_preset: ThemePreset::Studio,
             ..Default::default()
         };
         state.record_recent(&repo_a);

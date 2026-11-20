@@ -7,6 +7,7 @@ mod modals;
 mod motion_fx;
 mod repo_tab;
 mod state;
+mod theme_presets;
 mod ui_details;
 mod ui_graph;
 
@@ -21,9 +22,10 @@ use gpui::{
 
 use crate::app_view::{
     CloseActiveTab, FocusSearch, GitGraphApp, OpenRepository, QuitApp, RefreshGraph, ToggleDetails,
-    ToggleTheme, ZoomIn, ZoomOut, ZoomReset,
+    ToggleTheme, ToggleThemePreset, ZoomIn, ZoomOut, ZoomReset,
 };
 use crate::state::load_persisted_state;
+use crate::theme_presets::apply_theme_preset;
 
 fn app_menus() -> Vec<Menu> {
     vec![
@@ -52,6 +54,7 @@ fn app_menus() -> Vec<Menu> {
                 MenuItem::action("重置界面缩放", ZoomReset),
                 MenuItem::separator(),
                 MenuItem::action("切换浅色 / 深色主题", ToggleTheme),
+                MenuItem::action("切换配色主题 (默认 / Studio)", ToggleThemePreset),
             ],
             disabled: false,
         },
@@ -76,6 +79,7 @@ fn launch(initial_repos: Vec<PathBuf>, cx: &mut App) -> Result<()> {
     ely_core::init(cx).context("初始化 Ely UI 组件库失败")?;
 
     let persisted = load_persisted_state();
+    apply_theme_preset(persisted.theme_preset, cx);
     if persisted.dark_mode {
         Theme::set_mode_now(Mode::Dark, cx);
     } else {

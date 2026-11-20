@@ -40,9 +40,10 @@ use crate::repo_tab::{
     load_commit_details, load_file_diff, load_file_line_counts, load_repo_snapshot,
 };
 use crate::state::{
-    DEFAULT_UI_SCALE, MAX_UI_SCALE, MIN_UI_SCALE, PersistedState, repo_display_name,
+    DEFAULT_UI_SCALE, MAX_UI_SCALE, MIN_UI_SCALE, PersistedState, ThemePreset, repo_display_name,
     save_persisted_state, short_hash,
 };
+use crate::theme_presets::apply_theme_preset;
 use crate::ui_details::render_details_pane;
 use crate::ui_graph::{
     ResizeCol, SyncButtonAction, render_filter_toolbar, render_graph_table, row_height,
@@ -56,6 +57,7 @@ gpui::actions!(
         CloseActiveTab,
         RefreshGraph,
         ToggleTheme,
+        ToggleThemePreset,
         ToggleDetails,
         FocusSearch,
         ZoomIn,
@@ -986,6 +988,27 @@ impl GitGraphApp {
         self.persisted.dark_mode = next_dark;
         self.save_state();
         cx.notify();
+    }
+
+    pub fn set_theme_preset(&mut self, preset: ThemePreset, cx: &mut Context<Self>) {
+        if self.persisted.theme_preset == preset {
+            return;
+        }
+        self.persisted.theme_preset = preset;
+        apply_theme_preset(preset, cx);
+        self.save_state();
+        self.push_toast(
+            format!("已切换至「{}」配色", preset.display_name()),
+            Severity::Info,
+            None,
+            cx,
+        );
+        cx.notify();
+    }
+
+    pub fn toggle_theme_preset(&mut self, cx: &mut Context<Self>) {
+        let next = self.persisted.theme_preset.toggled();
+        self.set_theme_preset(next, cx);
     }
 
     pub fn set_column_width(&mut self, col: ResizeCol, width: f32, cx: &mut Context<Self>) {
@@ -2384,6 +2407,14 @@ impl GitGraphApp {
                 }
             });
 
+        let palette_menu = build_theme_preset_menu(self.persisted.theme_preset, dark, &weak);
+        let palette_btn = OverflowMenu::new("titlebar-theme-preset", palette_menu)
+            .icon(IconName::Palette)
+            .tooltip(format!(
+                "配色主题：{}（点击切换默认 / Studio）",
+                self.persisted.theme_preset.display_name()
+            ));
+
         let theme_btn = IconButton::new(
             "titlebar-theme-toggle",
             if dark { IconName::Sun } else { IconName::Moon },
@@ -2421,6 +2452,7 @@ impl GitGraphApp {
                     .occlude()
                     .child(recent_btn)
                     .child(open_btn)
+                    .child(palette_btn)
                     .child(theme_btn),
             )
             .into_any_element()
@@ -2751,6 +2783,9 @@ impl Render for GitGraphApp {
             .on_action(cx.listener(|this, _: &ToggleTheme, _, cx| {
                 this.toggle_theme(cx);
             }))
+            .on_action(cx.listener(|this, _: &ToggleThemePreset, _, cx| {
+                this.toggle_theme_preset(cx);
+            }))
             .on_action(cx.listener(|this, _: &ToggleDetails, _, cx| {
                 this.toggle_details_pane(cx);
             }))
@@ -2848,6 +2883,48 @@ fn build_recent_repos_menu(
     }
 
     menu
+}
+
+/// 构建标题栏「配色主题」下拉菜单（默认配色 / Studio 高对比 + 浅色/深色）。
+fn build_theme_preset_menu(
+    current: ThemePreset,
+    dark: bool,
+    weak: &gpui::WeakEntity<GitGraphApp>,
+) -> Menu {
+    let weak_default = weak.clone();
+    let weak_studio = weak.clone();
+    let weak_mode = weak.clone();
+    Menu::new()
+        .group(
+            "配色主题",
+            vec![
+                MenuItem::check("默认配色（暖灰极简）", current == ThemePreset::Default).on_click(
+                    move |_, cx| {
+                        weak_default
+                            .update(cx, |this, cx| {
+                                this.set_theme_preset(ThemePreset::Default, cx)
+                            })
+                            .ok();
+                    },
+                ),
+                MenuItem::check("Studio 高对比（Zinc + Sky）", current == ThemePreset::Studio)
+                    .on_click(move |_, cx| {
+                        weak_studio
+                            .update(cx, |this, cx| {
+                                this.set_theme_preset(ThemePreset::Studio, cx)
+                            })
+                            .ok();
+                    }),
+            ],
+        )
+        .separator()
+        .item(
+            MenuItem::check("深色模式", dark).on_click(move |_, cx| {
+                weak_mode
+                    .update(cx, |this, cx| this.toggle_theme(cx))
+                    .ok();
+            }),
+        )
 }
 
 #[cfg(test)]
